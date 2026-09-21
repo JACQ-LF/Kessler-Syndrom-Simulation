@@ -1,0 +1,27 @@
+# Identifiants Space-Track — ne JAMAIS versionner
+.env
+
+# Sorties de simulation (regenerables)
+output/
+
+# Build
+build/
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editeurs / OS
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

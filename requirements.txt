@@ -1,0 +1,8 @@
+# Export du catalogue Space-Track (scripts/spacetrack_export.py)
+requests>=2.31
+skyfield>=1.46
+python-dotenv>=1.0
+
+# Trace des trajectoires (scripts/plot_orbits.py)
+numpy>=1.24
+matplotlib>=3.7

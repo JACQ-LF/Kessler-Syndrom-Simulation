@@ -1,0 +1,7 @@
+* text=auto
+
+*.cpp  text diff=cpp
+*.py   text diff=python
+*.md   text diff=markdown
+*.txt  text
+*.csv  text
