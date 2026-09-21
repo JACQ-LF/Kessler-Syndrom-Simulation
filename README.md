@@ -14,7 +14,8 @@ de collisions, fragmentation, cascade.
 |---|---|
 | Export du catalogue Space-Track à un epoch commun | fait |
 | Propagation RK4 (Terre + J2 + Lune) | fait |
-| Visualisation 3D des trajectoires | fait |
+| Viewer 3D temps réel, filtres et suivi d'objets | fait |
+| Tracés matplotlib (trajectoires, instantanés) | fait |
 | Détection de collisions | à faire |
 | Modèle de fragmentation | à faire |
 | Traînée atmosphérique | à faire |
@@ -23,7 +24,10 @@ de collisions, fragmentation, cascade.
 
 ```
 .
-├── src/main.cpp            simulateur (lecture, RK4, sorties CSV)
+├── src/
+│   ├── core/orbital.*      dynamique partagée : RK4, J2, Lune, entrées/sorties
+│   ├── main.cpp            simulation en ligne de commande
+│   └── viewer/viewer.cpp   viewer 3D temps réel (raylib + Dear ImGui)
 ├── scripts/
 │   ├── spacetrack_export.py   télécharge les TLE et les propage à un epoch commun
 │   ├── plot_orbits.py         trace les trajectoires de quelques objets
@@ -38,13 +42,29 @@ de collisions, fragmentation, cascade.
 ## Démarrage rapide
 
 ```bash
-cmake -B build && cmake --build build --config Release
+cmake -B build && cmake --build build
 ```
 
-Sans CMake, la compilation directe fonctionne aussi :
+Deux binaires apparaissent à la racine : `kessler_sim` (simulation) et
+`kessler_viewer` (viewer 3D). La configuration télécharge raylib, Dear ImGui et
+rlImGui — comptez quelques minutes la première fois, et une connexion.
+
+Pour ne compiler que la simulation, sans dépendance ni réseau :
 
 ```bash
-g++ -O2 -std=c++17 -fopenmp src/main.cpp -o kessler_sim
+cmake -B build -DKESSLER_BUILD_VIEWER=OFF && cmake --build build
+```
+
+Sans CMake du tout, la simulation seule se compile en une ligne :
+
+```bash
+g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/main.cpp -o kessler_sim
+```
+
+Sur MSYS2, CMake s'installe avec :
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
 ```
 
 Puis, **depuis la racine du dépôt** (les chemins sont relatifs au répertoire courant) :
@@ -72,7 +92,58 @@ kessler_sim [fichier] [durée_h] [pas_s] [période_sortie_s] [ids_norad]
 Tout est écrit dans `output/` : `final_state.csv`, les `snapshot_N.csv`, et
 `trajectories.csv` + `moon.csv` quand des identifiants sont donnés.
 
-### Visualisation
+## Viewer 3D
+
+```bash
+./kessler_viewer
+```
+
+Affiche l'intégralité du catalogue en temps réel. Le rendu passe par quatre
+appels instanciés — un par catégorie d'objet — et tient les 28 340 objets à
+60 fps. L'occultation par la Terre est gérée par le tampon de profondeur du
+GPU, donc correctement, contrairement aux tracés matplotlib.
+
+| Commande | Action |
+|---|---|
+| Glisser | tourner autour de la Terre |
+| Molette | zoomer, de l'orbite basse à l'orbite lunaire |
+| Clic droit | sélectionner l'objet sous le curseur |
+| Espace | lancer ou suspendre la propagation |
+
+**Deux modes.** *Live* propage avec le même RK4 que la simulation en ligne de
+commande — le code de `src/core` est partagé, il n'y a pas deux dynamiques à
+maintenir. Le pas et le nombre de pas par image se règlent en cours de route :
+à 10 s de pas et 6 pas par image, le temps défile 3 600 fois plus vite que le
+temps réel. *Relecture* rejoue les `snapshot_*.csv` produits par `kessler_sim`,
+donc exactement ce que la simulation a calculé :
+
+```bash
+./kessler_sim data/satellites_20260801_1000Z.txt 6 10 1800   # 12 snapshots
+./kessler_viewer                                             # puis mode Relecture
+```
+
+**Filtres.** Cases par catégorie, plages d'altitude et d'inclinaison,
+recherche par nom ou par NORAD, et raccourcis LEO / MEO / GEO. Le compte
+d'objets affichés se met à jour en direct.
+
+**Suivi.** Un objet sélectionné affiche ses éléments orbitaux (périgée, apogée,
+inclinaison, excentricité, période, vitesse). Le bouton *Suivre* trace son
+orbite complète et l'étiquette dans la vue ; *Caméra liée* centre la vue
+dessus. Plusieurs objets peuvent être suivis en même temps.
+
+Le viewer écrit un `imgui.ini` à la racine pour mémoriser la disposition des
+panneaux. Il est dans le `.gitignore` ; le supprimer rétablit la disposition
+d'origine.
+
+Pour une image sans interaction (utile en capture ou en script) :
+
+```bash
+./kessler_viewer --screenshot output/vue.png --frames 60
+```
+
+## Tracés matplotlib
+
+Plus limités que le viewer, mais pratiques pour produire une figure fixe.
 
 ```bash
 pip install -r requirements.txt
@@ -143,6 +214,9 @@ qu'au nuage de points : les trajectoires de `plot_orbits.py`, étant des lignes
 continues, traversent toujours le globe.
 
 ## Modèle physique
+
+Implémenté une seule fois dans `src/core/orbital.cpp`, et utilisé tel quel par
+la simulation comme par le viewer.
 
 Intégrateur Runge-Kutta d'ordre 4, en repère inertiel géocentrique (ECI), avec :
 

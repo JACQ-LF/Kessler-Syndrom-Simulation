@@ -4,6 +4,9 @@
 # Sorties de simulation (regenerables)
 output/
 
+# Disposition des fenetres du viewer, propre a chaque poste
+imgui.ini
+
 # Build
 build/
 *.exe
