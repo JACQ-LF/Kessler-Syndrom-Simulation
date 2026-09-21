@@ -103,14 +103,70 @@ def load_object_types():
 # Elements de figure
 # ---------------------------------------------------------------------------
 
-def draw_earth(ax, alpha=0.25):
+def draw_earth(ax, alpha=0.25, **kwargs):
     u, v = np.mgrid[0:2 * np.pi:40j, 0:np.pi:20j]
     ax.plot_surface(
         R_EARTH * np.cos(u) * np.sin(v),
         R_EARTH * np.sin(u) * np.sin(v),
         R_EARTH * np.cos(v),
-        color="tab:blue", alpha=alpha, linewidth=0,
+        color="tab:blue", alpha=alpha, linewidth=0, **kwargs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Occultation par la Terre
+#
+# mplot3d ne fait pas de tampon de profondeur : il trie les artistes entre eux,
+# pas fragment par fragment. Un nuage de points passe donc entierement devant
+# ou derriere la sphere terrestre, et les objets situes de l'autre cote du
+# globe restent visibles meme avec une Terre opaque. On masque donc nous-memes
+# les points caches, en refaisant le test a chaque rotation de la vue.
+# ---------------------------------------------------------------------------
+
+def camera_direction(ax):
+    """Vecteur unitaire allant de l'origine vers la camera."""
+    elev, azim = np.radians(ax.elev), np.radians(ax.azim)
+    return np.array([np.cos(elev) * np.cos(azim),
+                     np.cos(elev) * np.sin(azim),
+                     np.sin(elev)])
+
+
+def occluded_by_earth(pos, cam, radius=R_EARTH):
+    """Masque des points caches par le globe, vus depuis la direction `cam`.
+
+    Un point est cache s'il est de l'autre cote de la Terre (composante
+    negative le long de l'axe camera) et si sa distance a cet axe est
+    inferieure au rayon terrestre — autrement dit s'il tombe dans la
+    silhouette du globe. Exact en projection orthographique, tres legerement
+    approche au ras du limbe en projection perspective.
+    """
+    along = pos @ cam
+    perp = np.linalg.norm(pos - np.outer(along, cam), axis=1)
+    return (along < 0) & (perp < radius)
+
+
+def apply_occlusion(scatters, ax):
+    """Rend transparents les points caches par la Terre, pour la vue courante."""
+    cam = camera_direction(ax)
+    for scatter, positions, rgba in scatters:
+        colors = np.tile(rgba, (len(positions), 1))
+        colors[occluded_by_earth(positions, cam), 3] = 0.0
+        scatter.set_facecolor(colors)
+
+
+def watch_rotation(fig, ax, scatters):
+    """Recalcule l'occultation quand l'utilisateur fait tourner la vue."""
+    last = {}
+
+    def on_draw(_event):
+        view = (ax.elev, ax.azim, getattr(ax, "roll", 0))
+        if last.get("view") == view:
+            return
+        last["view"] = view
+        apply_occlusion(scatters, ax)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("draw_event", on_draw)
 
 
 def set_equal_axes(ax, extent):

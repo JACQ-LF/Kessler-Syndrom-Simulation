@@ -113,6 +113,8 @@ python scripts/plot_snapshot.py --file output/snapshot_3.csv --no-run
 | `--max-alt` | ne garder que les objets sous cette altitude, en km |
 | `--file` | CSV à tracer (défaut `output/final_state.csv`) |
 | `--seed` | graine de l'échantillonnage, pour un tirage reproductible |
+| `--earth-alpha` | opacité du globe en vue 3D (défaut 1) |
+| `--show-hidden` | ne pas masquer les objets situés derrière la Terre |
 
 La vue `alt-inc` place l'altitude en abscisse (échelle log) et l'inclinaison en
 ordonnée. C'est le tracé classique en analyse de débris : chaque amas y
@@ -122,6 +124,23 @@ constellations autour de 53°, les GNSS vers 20 000 km, et le mur géostationnai
 
 En vue 3D, les quelques objets très hauts écrasent l'échelle et compriment la
 couche basse en une coquille ; `--max-alt 2000` donne une vue LEO lisible.
+
+#### Occultation par la Terre
+
+`mplot3d` ne dispose pas de tampon de profondeur : il trie les artistes entre
+eux, pas fragment par fragment. Un nuage de points passe donc *entièrement*
+devant ou derrière le globe, et augmenter l'opacité de la Terre n'y change
+rien — les objets de l'autre côté restent visibles au travers.
+
+Le script corrige ça en testant lui-même, point par point, si l'objet tombe
+dans la silhouette du globe du côté opposé à la caméra ; les points concernés
+sont rendus transparents. Le test est refait à chaque rotation de la vue. Il
+est exact en projection orthographique, et très légèrement approché au ras du
+limbe en projection perspective (celle par défaut).
+
+`--show-hidden` rétablit l'ancien comportement. Ce traitement ne s'applique
+qu'au nuage de points : les trajectoires de `plot_orbits.py`, étant des lignes
+continues, traversent toujours le globe.
 
 ## Modèle physique
 
