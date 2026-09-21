@@ -17,47 +17,15 @@ Prerequis : kessler_sim compile (voir README), numpy, matplotlib.
 
 import argparse
 import csv
-import os
-import subprocess
 import sys
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent
-DATA_FILE = ROOT / "data" / "satellites_20260801_1000Z.txt"
-OUT_DIR = ROOT / "output"
-
-R_EARTH = 6378.137  # km
+from plot_common import OUT_DIR, draw_earth, finish, run_sim, set_equal_axes
 
 # ISS, Hubble, Aqua, NOAA 18, NOAA 20, EWS-G2 (GEO)
 DEFAULT_IDS = [25544, 20580, 27424, 28654, 43013, 36411]
-
-
-def find_executable():
-    """Cherche le binaire a la racine puis dans les repertoires de build usuels."""
-    name = "kessler_sim.exe" if os.name == "nt" else "kessler_sim"
-    candidates = [ROOT / name, ROOT / "build" / name,
-                  ROOT / "build" / "Release" / name, ROOT / "build" / "Debug" / name]
-    for path in candidates:
-        if path.exists():
-            return path
-    sys.exit(
-        f"{name} introuvable. Compile d'abord :\n"
-        f"    cmake -B build && cmake --build build --config Release"
-    )
-
-
-def run_sim(ids, hours, dt, every):
-    if not DATA_FILE.exists():
-        sys.exit(f"{DATA_FILE} introuvable : lance d'abord scripts/spacetrack_export.py.")
-    # cwd = racine du depot : le binaire ecrit dans output/ relativement au cwd.
-    subprocess.run(
-        [str(find_executable()), str(DATA_FILE), str(hours), str(dt), str(every),
-         ",".join(map(str, ids))],
-        cwd=ROOT, check=True,
-    )
 
 
 def load_trajectories(path):
@@ -72,23 +40,6 @@ def load_trajectories(path):
                 (float(row["x_km"]), float(row["y_km"]), float(row["z_km"]))
             )
     return {k: np.array(v) for k, v in trajs.items()}
-
-
-def draw_earth(ax):
-    u, v = np.mgrid[0:2 * np.pi:40j, 0:np.pi:20j]
-    ax.plot_surface(
-        R_EARTH * np.cos(u) * np.sin(v),
-        R_EARTH * np.sin(u) * np.sin(v),
-        R_EARTH * np.cos(v),
-        color="tab:blue", alpha=0.25, linewidth=0,
-    )
-
-
-def set_equal_axes(ax, extent):
-    ax.set_xlim(-extent, extent)
-    ax.set_ylim(-extent, extent)
-    ax.set_zlim(-extent, extent)
-    ax.set_box_aspect((1, 1, 1))
 
 
 def main():
@@ -106,7 +57,7 @@ def main():
     args = p.parse_args()
 
     if not args.no_run:
-        run_sim(args.ids or DEFAULT_IDS, args.hours, args.dt, args.every)
+        run_sim(args.hours, args.dt, args.every, args.ids or DEFAULT_IDS)
 
     trajs = load_trajectories(OUT_DIR / "trajectories.csv")
     fig = plt.figure(figsize=(9, 9))
@@ -132,13 +83,7 @@ def main():
     ax.set_zlabel("Z (km)")
     ax.set_title(f"Trajectoires ECI — {args.hours:g} h")
     ax.legend(loc="upper left", fontsize=8)
-    plt.tight_layout()
-
-    if args.save:
-        fig.savefig(args.save, dpi=130)
-        print(f"Image enregistree dans {args.save}")
-    else:
-        plt.show()
+    finish(fig, args.save)
 
 
 if __name__ == "__main__":

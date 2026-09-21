@@ -26,7 +26,9 @@ de collisions, fragmentation, cascade.
 ├── src/main.cpp            simulateur (lecture, RK4, sorties CSV)
 ├── scripts/
 │   ├── spacetrack_export.py   télécharge les TLE et les propage à un epoch commun
-│   ├── plot_orbits.py         lance la simu et trace les trajectoires en 3D
+│   ├── plot_orbits.py         trace les trajectoires de quelques objets
+│   ├── plot_snapshot.py       trace un instantané du catalogue (nuage de points)
+│   ├── plot_common.py         briques partagées par les deux scripts de tracé
 │   └── check_duplicates.py    vérifie l'absence de doublons dans un export
 ├── data/                   états initiaux (versionnés)
 ├── output/                 sorties de simulation (ignorées par git)
@@ -74,21 +76,52 @@ Tout est écrit dans `output/` : `final_state.csv`, les `snapshot_N.csv`, et
 
 ```bash
 pip install -r requirements.txt
-python scripts/plot_orbits.py
 ```
 
-Sans argument, le script simule 6 h pour l'ISS, Hubble, Aqua, NOAA 18, NOAA 20
-et EWS-G2 (géostationnaire), puis ouvre une vue 3D.
+Deux scripts, qui lancent la simulation puis tracent le résultat. `--no-run`
+réutilise le CSV existant, `--save FICHIER` enregistre au lieu d'afficher.
+
+**Trajectoires de quelques objets** — `plot_orbits.py`
 
 ```bash
-python scripts/plot_orbits.py 25544 20580 --hours 3
+python scripts/plot_orbits.py                       # 6 h, sélection par défaut
+python scripts/plot_orbits.py 25544 20580 --hours 3 # ISS + Hubble
 python scripts/plot_orbits.py 36411 --hours 48 --moon
-python scripts/plot_orbits.py --no-run --save orbites.png
 ```
 
+Sans argument : ISS, Hubble, Aqua, NOAA 18, NOAA 20 et EWS-G2 (géostationnaire).
 `--moon` ajoute la Lune, ce qui étend l'échelle à ~400 000 km et réduit les
-orbites basses à un point. `--no-run` retrace le dernier CSV sans relancer la
-simulation.
+orbites basses à un point.
+
+**Instantané du catalogue** — `plot_snapshot.py`
+
+Nuage de points d'un échantillon d'objets, coloré par catégorie (charge utile,
+débris, étage de fusée).
+
+```bash
+python scripts/plot_snapshot.py                     # 1000 objets, vue 3D
+python scripts/plot_snapshot.py -n 5000 --hours 72
+python scripts/plot_snapshot.py --max-alt 2000      # LEO seulement
+python scripts/plot_snapshot.py --view alt-inc -n 28340 --size 2
+python scripts/plot_snapshot.py --file output/snapshot_3.csv --no-run
+```
+
+| Option | Rôle |
+|---|---|
+| `-n` | taille de l'échantillon (défaut 1000) |
+| `--view` | `3d` (défaut) ou `alt-inc` |
+| `--max-alt` | ne garder que les objets sous cette altitude, en km |
+| `--file` | CSV à tracer (défaut `output/final_state.csv`) |
+| `--seed` | graine de l'échantillonnage, pour un tirage reproductible |
+
+La vue `alt-inc` place l'altitude en abscisse (échelle log) et l'inclinaison en
+ordonnée. C'est le tracé classique en analyse de débris : chaque amas y
+correspond à un régime orbital — la bande héliosynchrone vers 98°, les
+constellations autour de 53°, les GNSS vers 20 000 km, et le mur géostationnaire
+à 35 786 km.
+
+En vue 3D, les quelques objets très hauts écrasent l'échelle et compriment la
+couche basse en une coquille ; `--max-alt 2000` donne une vue LEO lisible.
 
 ## Modèle physique
 
