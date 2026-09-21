@@ -14,7 +14,8 @@ de collisions, fragmentation, cascade.
 |---|---|
 | Export du catalogue Space-Track à un epoch commun | fait |
 | Propagation RK4 (Terre + J2 + Lune) | fait |
-| Visualisation 3D des trajectoires | fait |
+| Viewer 3D temps réel, filtres et suivi d'objets | fait |
+| Tracés matplotlib (trajectoires, instantanés) | fait |
 | Détection de collisions | à faire |
 | Modèle de fragmentation | à faire |
 | Traînée atmosphérique | à faire |
@@ -23,10 +24,15 @@ de collisions, fragmentation, cascade.
 
 ```
 .
-├── src/main.cpp            simulateur (lecture, RK4, sorties CSV)
+├── src/
+│   ├── core/orbital.*      dynamique partagée : RK4, J2, Lune, entrées/sorties
+│   ├── main.cpp            simulation en ligne de commande
+│   └── viewer/viewer.cpp   viewer 3D temps réel (raylib + Dear ImGui)
 ├── scripts/
 │   ├── spacetrack_export.py   télécharge les TLE et les propage à un epoch commun
-│   ├── plot_orbits.py         lance la simu et trace les trajectoires en 3D
+│   ├── plot_orbits.py         trace les trajectoires de quelques objets
+│   ├── plot_snapshot.py       trace un instantané du catalogue (nuage de points)
+│   ├── plot_common.py         briques partagées par les deux scripts de tracé
 │   └── check_duplicates.py    vérifie l'absence de doublons dans un export
 ├── data/                   états initiaux (versionnés)
 ├── output/                 sorties de simulation (ignorées par git)
@@ -36,13 +42,29 @@ de collisions, fragmentation, cascade.
 ## Démarrage rapide
 
 ```bash
-cmake -B build && cmake --build build --config Release
+cmake -B build && cmake --build build
 ```
 
-Sans CMake, la compilation directe fonctionne aussi :
+Deux binaires apparaissent à la racine : `kessler_sim` (simulation) et
+`kessler_viewer` (viewer 3D). La configuration télécharge raylib, Dear ImGui et
+rlImGui — comptez quelques minutes la première fois, et une connexion.
+
+Pour ne compiler que la simulation, sans dépendance ni réseau :
 
 ```bash
-g++ -O2 -std=c++17 -fopenmp src/main.cpp -o kessler_sim
+cmake -B build -DKESSLER_BUILD_VIEWER=OFF && cmake --build build
+```
+
+Sans CMake du tout, la simulation seule se compile en une ligne :
+
+```bash
+g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/main.cpp -o kessler_sim
+```
+
+Sur MSYS2, CMake s'installe avec :
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
 ```
 
 Puis, **depuis la racine du dépôt** (les chemins sont relatifs au répertoire courant) :
@@ -70,27 +92,131 @@ kessler_sim [fichier] [durée_h] [pas_s] [période_sortie_s] [ids_norad]
 Tout est écrit dans `output/` : `final_state.csv`, les `snapshot_N.csv`, et
 `trajectories.csv` + `moon.csv` quand des identifiants sont donnés.
 
-### Visualisation
+## Viewer 3D
+
+```bash
+./kessler_viewer
+```
+
+Affiche l'intégralité du catalogue en temps réel. Le rendu passe par quatre
+appels instanciés — un par catégorie d'objet — et tient les 28 340 objets à
+60 fps. L'occultation par la Terre est gérée par le tampon de profondeur du
+GPU, donc correctement, contrairement aux tracés matplotlib.
+
+| Commande | Action |
+|---|---|
+| Glisser | tourner autour de la Terre |
+| Molette | zoomer, de l'orbite basse à l'orbite lunaire |
+| Clic droit | sélectionner l'objet sous le curseur |
+| Espace | lancer ou suspendre la propagation |
+
+**Deux modes.** *Live* propage avec le même RK4 que la simulation en ligne de
+commande — le code de `src/core` est partagé, il n'y a pas deux dynamiques à
+maintenir. Le pas et le nombre de pas par image se règlent en cours de route :
+à 10 s de pas et 6 pas par image, le temps défile 3 600 fois plus vite que le
+temps réel. *Relecture* rejoue les `snapshot_*.csv` produits par `kessler_sim`,
+donc exactement ce que la simulation a calculé :
+
+```bash
+./kessler_sim data/satellites_20260801_1000Z.txt 6 10 1800   # 12 snapshots
+./kessler_viewer                                             # puis mode Relecture
+```
+
+**Filtres.** Cases par catégorie, plages d'altitude et d'inclinaison,
+recherche par nom ou par NORAD, et raccourcis LEO / MEO / GEO. Le compte
+d'objets affichés se met à jour en direct.
+
+**Suivi.** Un objet sélectionné affiche ses éléments orbitaux (périgée, apogée,
+inclinaison, excentricité, période, vitesse). Le bouton *Suivre* trace son
+orbite complète et l'étiquette dans la vue ; *Caméra liée* centre la vue
+dessus. Plusieurs objets peuvent être suivis en même temps.
+
+Le viewer écrit un `imgui.ini` à la racine pour mémoriser la disposition des
+panneaux. Il est dans le `.gitignore` ; le supprimer rétablit la disposition
+d'origine.
+
+Pour une image sans interaction (utile en capture ou en script) :
+
+```bash
+./kessler_viewer --screenshot output/vue.png --frames 60
+```
+
+## Tracés matplotlib
+
+Plus limités que le viewer, mais pratiques pour produire une figure fixe.
 
 ```bash
 pip install -r requirements.txt
-python scripts/plot_orbits.py
 ```
 
-Sans argument, le script simule 6 h pour l'ISS, Hubble, Aqua, NOAA 18, NOAA 20
-et EWS-G2 (géostationnaire), puis ouvre une vue 3D.
+Deux scripts, qui lancent la simulation puis tracent le résultat. `--no-run`
+réutilise le CSV existant, `--save FICHIER` enregistre au lieu d'afficher.
+
+**Trajectoires de quelques objets** — `plot_orbits.py`
 
 ```bash
-python scripts/plot_orbits.py 25544 20580 --hours 3
+python scripts/plot_orbits.py                       # 6 h, sélection par défaut
+python scripts/plot_orbits.py 25544 20580 --hours 3 # ISS + Hubble
 python scripts/plot_orbits.py 36411 --hours 48 --moon
-python scripts/plot_orbits.py --no-run --save orbites.png
 ```
 
+Sans argument : ISS, Hubble, Aqua, NOAA 18, NOAA 20 et EWS-G2 (géostationnaire).
 `--moon` ajoute la Lune, ce qui étend l'échelle à ~400 000 km et réduit les
-orbites basses à un point. `--no-run` retrace le dernier CSV sans relancer la
-simulation.
+orbites basses à un point.
+
+**Instantané du catalogue** — `plot_snapshot.py`
+
+Nuage de points d'un échantillon d'objets, coloré par catégorie (charge utile,
+débris, étage de fusée).
+
+```bash
+python scripts/plot_snapshot.py                     # 1000 objets, vue 3D
+python scripts/plot_snapshot.py -n 5000 --hours 72
+python scripts/plot_snapshot.py --max-alt 2000      # LEO seulement
+python scripts/plot_snapshot.py --view alt-inc -n 28340 --size 2
+python scripts/plot_snapshot.py --file output/snapshot_3.csv --no-run
+```
+
+| Option | Rôle |
+|---|---|
+| `-n` | taille de l'échantillon (défaut 1000) |
+| `--view` | `3d` (défaut) ou `alt-inc` |
+| `--max-alt` | ne garder que les objets sous cette altitude, en km |
+| `--file` | CSV à tracer (défaut `output/final_state.csv`) |
+| `--seed` | graine de l'échantillonnage, pour un tirage reproductible |
+| `--earth-alpha` | opacité du globe en vue 3D (défaut 1) |
+| `--show-hidden` | ne pas masquer les objets situés derrière la Terre |
+
+La vue `alt-inc` place l'altitude en abscisse (échelle log) et l'inclinaison en
+ordonnée. C'est le tracé classique en analyse de débris : chaque amas y
+correspond à un régime orbital — la bande héliosynchrone vers 98°, les
+constellations autour de 53°, les GNSS vers 20 000 km, et le mur géostationnaire
+à 35 786 km.
+
+En vue 3D, les quelques objets très hauts écrasent l'échelle et compriment la
+couche basse en une coquille ; `--max-alt 2000` donne une vue LEO lisible.
+
+#### Occultation par la Terre
+
+`mplot3d` ne dispose pas de tampon de profondeur : il trie les artistes entre
+eux, pas fragment par fragment. Un nuage de points passe donc *entièrement*
+devant ou derrière le globe, et augmenter l'opacité de la Terre n'y change
+rien — les objets de l'autre côté restent visibles au travers.
+
+Le script corrige ça en testant lui-même, point par point, si l'objet tombe
+dans la silhouette du globe du côté opposé à la caméra ; les points concernés
+sont rendus transparents. Le test est refait à chaque rotation de la vue. Il
+est exact en projection orthographique, et très légèrement approché au ras du
+limbe en projection perspective (celle par défaut).
+
+`--show-hidden` rétablit l'ancien comportement. Ce traitement ne s'applique
+qu'au nuage de points : les trajectoires de `plot_orbits.py`, étant des lignes
+continues, traversent toujours le globe.
 
 ## Modèle physique
+
+Implémenté une seule fois dans `src/core/orbital.cpp`, et utilisé tel quel par
+la simulation comme par le viewer.
 
 Intégrateur Runge-Kutta d'ordre 4, en repère inertiel géocentrique (ECI), avec :
 
