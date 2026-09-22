@@ -345,7 +345,11 @@ void draw_simulation_panel(App& app) {
 
         ImGui::SliderInt("Pas par image", &app.steps_per_frame, 1, 60);
         float dt = static_cast<float>(app.sim.dt);
-        if (ImGui::SliderFloat("Pas dt (s)", &dt, 1.0f, 120.0f, "%.0f")) app.sim.dt = dt;
+        // Echelle logarithmique : sur 0.1 - 120 s, un curseur lineaire rendrait
+        // les petits pas quasiment impossibles a regler.
+        if (ImGui::SliderFloat("Pas dt (s)", &dt, 0.1f, 120.0f, "%.1f",
+                               ImGuiSliderFlags_Logarithmic))
+            app.sim.dt = dt;
         ImGui::Text("Vitesse : %.0f x temps reel",
                     app.sim.dt * app.steps_per_frame * (GetFPS() > 0 ? GetFPS() : 60));
     }
