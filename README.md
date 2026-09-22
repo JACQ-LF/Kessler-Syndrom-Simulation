@@ -16,7 +16,8 @@ de collisions, fragmentation, cascade.
 | Propagation RK4 (Terre + J2 + Lune) | fait |
 | Viewer 3D temps réel, filtres et suivi d'objets | fait |
 | Tracés matplotlib (trajectoires, instantanés) | fait |
-| Détection de collisions | à faire |
+| Détection des rapprochements et collisions (déterministe) | fait |
+| Collisions probabilistes (méthode CUBE), pour les runs longs | à faire |
 | Modèle de fragmentation | à faire |
 | Traînée atmosphérique | à faire |
 
@@ -26,6 +27,7 @@ de collisions, fragmentation, cascade.
 .
 ├── src/
 │   ├── core/orbital.*      dynamique partagée : RK4, J2, Lune, entrées/sorties
+│   ├── core/collision.*    détection des rapprochements : grille + instant de rapprochement
 │   ├── main.cpp            simulation en ligne de commande
 │   └── viewer/viewer.cpp   viewer 3D temps réel (raylib + Dear ImGui)
 ├── scripts/
@@ -65,7 +67,7 @@ cmake --build build
 Sans CMake du tout, la simulation seule se compile en une ligne :
 
 ```bash
-g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/main.cpp -o kessler_sim
+g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/core/collision.cpp src/main.cpp -o kessler_sim
 ```
 
 Sur MSYS2, CMake s'installe avec :
@@ -99,6 +101,79 @@ kessler_sim [fichier] [durée_h] [pas_s] [période_sortie_s] [ids_norad]
 
 Tout est écrit dans `output/` : `final_state.csv`, les `snapshot_N.csv`, et
 `trajectories.csv` + `moon.csv` quand des identifiants sont donnés.
+
+## Rapprochements et collisions
+
+```bash
+./kessler_sim data/satellites_20260801_1000Z.txt 24 10 --conj-km 5
+```
+
+Détecte, pendant la propagation, tous les passages à moins de `--conj-km`
+kilomètres, et signale une collision quand la distance descend sous la somme
+des rayons des deux objets. Le détail va dans `output/conjunctions.csv` :
+instant, identifiants, distance de passage, vitesse relative.
+
+| Option | Défaut | Rôle |
+|---|---|---|
+| `--screen` | — | active la détection avec le seuil par défaut |
+| `--conj-km X` | 5 | seuil de rapprochement retenu (active la détection) |
+| `--radius-scale S` | 1 | multiplie tous les rayons de collision |
+| `--min-vrel V` | 10 | vitesse relative minimale d'une rencontre, en m/s |
+
+**Principe.** Une grille de hachage ne retient que les paires assez proches en
+début de pas pour pouvoir se rencontrer pendant le pas — la taille de cellule
+suit la vitesse relative maximale fois le pas. Pour ces paires, l'instant de
+rapprochement maximal est calculé analytiquement, puis affiné par
+interpolation d'Hermite entre le début et la fin du pas.
+
+Le point clé : deux objets proches subissent presque la même gravité, donc
+leur mouvement *relatif* est quasi rectiligne sur un pas, même si leurs
+trajectoires absolues sont courbes. Une collision est détectée même si les
+deux objets se sont traversés entre deux pas — **la détection ne dépend pas du
+pas d'intégration**. Vérifié : sur 2 h, les 2 969 rapprochements trouvés à
+10 s de pas le sont tous à 1 s, appariés un pour un, avec au plus 9 mm d'écart
+sur la distance et 5 µs sur l'instant.
+
+**Rayons de collision.** Le catalogue ne donne qu'une catégorie de section
+radar : 0,1 m (SMALL), 0,4 m (MEDIUM, et objets sans catégorie), 2 m (LARGE).
+Valeurs indicatives, à calibrer ; `--radius-scale` les multiplie toutes.
+
+**Paires volant de concert.** Deux objets lancés ensemble peuvent voler à
+quelques centaines de mètres l'un de l'autre, à quelques m/s relatifs. Leur
+distance varie à peine d'un pas à l'autre, l'instant de rapprochement n'est pas
+défini, et un contact ne serait de toute façon pas une fragmentation
+hypervéloce. Sous `--min-vrel`, ces paires sont comptées à part au lieu d'être
+traitées comme des rencontres.
+
+### Premier bilan sur 24 h
+
+| Distance de passage | Rapprochements |
+|---|---|
+| < 5 km | 38 367 |
+| < 1 km | 1 493 |
+| < 100 m | 14 |
+| collision (rayons réels) | 0 |
+
+Le plus serré : 7,2 m entre STARLINK-3051 et STARLINK-34756. Vitesse relative
+médiane : 11,5 km/s.
+
+Le nombre de passages à moins de *d* croît comme *d²* — ~1 500 par km² et par
+jour, constant de 100 m à 5 km. C'est ce qu'on attend si les distances de
+passage se répartissent au hasard dans le plan de rencontre, et cela donne un
+ordre de grandeur direct du taux de collision :
+
+> taux ≈ 1 500 × (R₁ + R₂)² par jour, avec R en km
+
+Avec des rayons cumulés d'un mètre, environ 0,5 collision par an. Multiplier
+les rayons par *S* (`--radius-scale`) multiplie ce taux par *S²*.
+
+**Limite importante.** Les états initiaux viennent de TLE propagés par SGP4,
+dont l'erreur de position est de l'ordre du kilomètre. Chaque rapprochement
+individuel n'a donc rien d'une prédiction réelle : ce sont les statistiques
+qui sont représentatives, pas les événements.
+
+**Coût.** 24 h simulées en ~90 s, dont ~75 s de détection. Environ 124 000
+paires candidates par pas, au lieu de 400 millions.
 
 ## Viewer 3D
 
