@@ -102,7 +102,10 @@ struct OrbitCamera {
     void handle_input() {
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
             Vector2 d = GetMouseDelta();
-            azimuth -= d.x * 0.005f;
+            // Convention "on attrape le globe" : glisser vers la droite fait
+            // tourner la Terre vers la droite, donc la camera part a gauche,
+            // ce qui correspond a un azimut croissant.
+            azimuth += d.x * 0.005f;
             elevation = Clamp(elevation + d.y * 0.005f, -1.55f, 1.55f);
         }
         float wheel = GetMouseWheelMove();
