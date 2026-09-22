@@ -42,17 +42,24 @@ de collisions, fragmentation, cascade.
 ## Démarrage rapide
 
 ```bash
-cmake -B build && cmake --build build
+cmake -B build
+cmake --build build
 ```
 
 Deux binaires apparaissent à la racine : `kessler_sim` (simulation) et
 `kessler_viewer` (viewer 3D). La configuration télécharge raylib, Dear ImGui et
 rlImGui — comptez quelques minutes la première fois, et une connexion.
 
+> Les commandes de ce README sont écrites une par ligne exprès : Windows
+> PowerShell 5.1 ne connaît pas l'opérateur `&&`. Pour enchaîner sous
+> PowerShell, utilisez `;` ou `; if ($?) { ... }`. PowerShell 7 et les shells
+> POSIX acceptent `&&` sans problème.
+
 Pour ne compiler que la simulation, sans dépendance ni réseau :
 
 ```bash
-cmake -B build -DKESSLER_BUILD_VIEWER=OFF && cmake --build build
+cmake -B build -DKESSLER_BUILD_VIEWER=OFF
+cmake --build build
 ```
 
 Sans CMake du tout, la simulation seule se compile en une ligne :
@@ -67,7 +74,8 @@ Sur MSYS2, CMake s'installe avec :
 pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
 ```
 
-Puis, **depuis la racine du dépôt** (les chemins sont relatifs au répertoire courant) :
+Puis, **depuis la racine du dépôt** (les chemins sont relatifs au répertoire
+courant). Sous Windows, remplacez `./kessler_sim` par `.\kessler_sim.exe` :
 
 ```bash
 ./kessler_sim data/satellites_20260801_1000Z.txt 24 10

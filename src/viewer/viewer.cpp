@@ -102,7 +102,10 @@ struct OrbitCamera {
     void handle_input() {
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
             Vector2 d = GetMouseDelta();
-            azimuth -= d.x * 0.005f;
+            // Convention "on attrape le globe" : glisser vers la droite fait
+            // tourner la Terre vers la droite, donc la camera part a gauche,
+            // ce qui correspond a un azimut croissant.
+            azimuth += d.x * 0.005f;
             elevation = Clamp(elevation + d.y * 0.005f, -1.55f, 1.55f);
         }
         float wheel = GetMouseWheelMove();
@@ -266,27 +269,37 @@ struct App {
     }
 };
 
-// Propage une copie de l'etat sur une orbite complete, pour tracer la trace
-// d'un objet suivi. N'affecte pas la simulation.
-std::vector<Vector3> orbit_trail(const App& app, const Object& o, int samples = 160) {
-    std::vector<Vector3> pts;
-    Elements el = elements(o.s);
-    if (el.a <= 0 || el.period_min <= 0 || el.period_min > 60 * 24 * 40) return pts;
+// Une orbite complete propagee a partir de l'etat courant, sur une copie :
+// la simulation n'est pas affectee.
+struct OrbitSample {
+    std::vector<Vector3> points;   // pour le trace
+    double r_min = 0, r_max = 0;   // rayons extremes effectivement parcourus (km)
+    bool valid = false;
+};
 
-    double period = el.period_min * 60.0;
-    double dt = period / samples;
+OrbitSample propagate_orbit(const App& app, const Object& o, int samples) {
+    OrbitSample out;
+    Elements el = elements(o.s);
+    if (el.a <= 0 || el.period_min <= 0 || el.period_min > 60 * 24 * 40) return out;
+
+    double dt = el.period_min * 60.0 / samples;
     State s = o.s;
     double jd = app.sim.jd();
-    pts.reserve(samples + 1);
+    out.points.reserve(samples + 1);
+    out.r_min = out.r_max = norm(s.r);
     for (int k = 0; k <= samples; ++k) {
-        pts.push_back(to_render(s.r));
+        out.points.push_back(to_render(s.r));
+        double r = norm(s.r);
+        out.r_min = std::min(out.r_min, r);
+        out.r_max = std::max(out.r_max, r);
         Vec3 m0 = moon_position(jd);
         Vec3 m1 = moon_position(jd + dt / 2 / 86400.0);
         Vec3 m2 = moon_position(jd + dt / 86400.0);
         s = rk4(s, dt, m0, m1, m2);
         jd += dt / 86400.0;
     }
-    return pts;
+    out.valid = true;
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +355,11 @@ void draw_simulation_panel(App& app) {
 
         ImGui::SliderInt("Pas par image", &app.steps_per_frame, 1, 60);
         float dt = static_cast<float>(app.sim.dt);
-        if (ImGui::SliderFloat("Pas dt (s)", &dt, 1.0f, 120.0f, "%.0f")) app.sim.dt = dt;
+        // Echelle logarithmique : sur 0.1 - 120 s, un curseur lineaire rendrait
+        // les petits pas quasiment impossibles a regler.
+        if (ImGui::SliderFloat("Pas dt (s)", &dt, 0.1f, 120.0f, "%.1f",
+                               ImGuiSliderFlags_Logarithmic))
+            app.sim.dt = dt;
         ImGui::Text("Vitesse : %.0f x temps reel",
                     app.sim.dt * app.steps_per_frame * (GetFPS() > 0 ? GetFPS() : 60));
     }
@@ -406,12 +423,31 @@ void draw_selection_panel(App& app) {
         if (!o.rcs.empty()) ImGui::Text("Taille radar : %s", o.rcs.c_str());
         ImGui::Separator();
         ImGui::Text("Altitude    %.1f km", norm(o.s.r) - R_EARTH);
-        ImGui::Text("Perigee     %.1f km", el.perigee_alt);
-        ImGui::Text("Apogee      %.1f km", el.apogee_alt);
-        ImGui::Text("Inclinaison %.2f deg", el.inc);
-        ImGui::Text("Excentricite %.5f", el.e);
-        ImGui::Text("Periode     %.1f min", el.period_min);
         ImGui::Text("Vitesse     %.3f km/s", norm(o.s.v));
+        ImGui::Text("Inclinaison %.2f deg", el.inc);
+
+        // Perigee et apogee effectivement parcourus, mesures sur une orbite
+        // propagee avec la dynamique complete : stables d'une image a l'autre.
+        OrbitSample orb = propagate_orbit(app, o, 720);
+        if (orb.valid) {
+            ImGui::SeparatorText("Sur une orbite");
+            ImGui::Text("Perigee     %.1f km", orb.r_min - R_EARTH);
+            ImGui::Text("Apogee      %.1f km", orb.r_max - R_EARTH);
+            ImGui::Text("Excentricite %.5f", (orb.r_max - orb.r_min) / (orb.r_max + orb.r_min));
+        }
+
+        // Elements de l'ellipse keplerienne tangente a l'instant present.
+        // J2 deforme la trajectoire en continu : ils oscillent au cours de
+        // l'orbite (~20 km pour l'ISS), quel que soit le pas d'integration.
+        ImGui::SeparatorText("Osculateurs (instantanes)");
+        ImGui::TextDisabled("Perigee     %.1f km", el.perigee_alt);
+        ImGui::TextDisabled("Apogee      %.1f km", el.apogee_alt);
+        ImGui::TextDisabled("Excentricite %.5f", el.e);
+        ImGui::TextDisabled("Periode     %.1f min", el.period_min);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Ellipse keplerienne tangente a l'instant present.\n"
+                              "L'aplatissement terrestre (J2) la deforme en continu :\n"
+                              "ces valeurs oscillent au fil de l'orbite, c'est normal.");
         ImGui::Separator();
         bool tracked = app.is_tracked(app.selected);
         if (ImGui::Button(tracked ? "Ne plus suivre" : "Suivre")) app.toggle_tracked(app.selected);
@@ -574,7 +610,7 @@ int main(int argc, char** argv) {
 
         // Traces des objets suivis + mise en evidence
         for (int i : app.tracked) {
-            std::vector<Vector3> trail = orbit_trail(app, app.sim.objects[i]);
+            std::vector<Vector3> trail = propagate_orbit(app, app.sim.objects[i], 160).points;
             for (size_t k = 1; k < trail.size(); ++k)
                 DrawLine3D(trail[k - 1], trail[k], {255, 255, 120, 180});
         }
