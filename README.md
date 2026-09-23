@@ -214,6 +214,26 @@ inclinaison, excentricité, période, vitesse). Le bouton *Suivre* trace son
 orbite complète et l'étiquette dans la vue ; *Caméra liée* centre la vue
 dessus. Plusieurs objets peuvent être suivis en même temps.
 
+**Rapprochements en direct.** En mode Live, le panneau *Rapprochements* active
+la détection pendant que la simulation tourne. Chaque passage sous le seuil
+trace un segment entre les deux objets, qui s'efface en quelques secondes —
+rouge s'il s'agit d'une collision. La liste donne distance, noms, instant et
+vitesse relative ; un clic sélectionne l'objet et y accroche la caméra. Le
+seuil et le facteur de rayon se règlent sans interrompre la simulation.
+
+La détection coûte ~2 ms par pas, et elle tourne à *chaque* pas — c'est la
+condition pour ne rien rater. Avec 6 pas par image, comptez ~15 ms par image :
+le panneau affiche le coût et prévient quand il devient sensible.
+
+**Débogage de la grille.** La case *Debug : grille de détection* trace les
+cellules. Avec un objet sélectionné, elle montre sa cellule et les 26 voisines,
+c'est-à-dire exactement le voisinage examiné ; sans sélection, les cellules
+occupées les plus proches de la caméra.
+
+**État de départ**, pratique pour scripter : `--play` lance la propagation,
+`--detect` active aussi la détection, `--grid` affiche la grille, et
+`--radius-scale S` multiplie les rayons de collision.
+
 Le viewer écrit un `imgui.ini` à la racine pour mémoriser la disposition des
 panneaux. Il est dans le `.gitignore` ; le supprimer rétablit la disposition
 d'origine.
