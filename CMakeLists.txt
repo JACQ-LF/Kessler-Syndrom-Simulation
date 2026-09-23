@@ -23,7 +23,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}")
 # Coeur orbital, partage par la simulation et le viewer
 # ---------------------------------------------------------------------------
 
-add_library(kessler_core STATIC src/core/orbital.cpp)
+add_library(kessler_core STATIC
+    src/core/orbital.cpp
+    src/core/collision.cpp
+    src/core/threads.cpp)
 target_include_directories(kessler_core PUBLIC src)
 
 # OpenMP parallelise la propagation. Facultatif : sans lui tout fonctionne,

@@ -16,7 +16,8 @@ de collisions, fragmentation, cascade.
 | Propagation RK4 (Terre + J2 + Lune) | fait |
 | Viewer 3D temps réel, filtres et suivi d'objets | fait |
 | Tracés matplotlib (trajectoires, instantanés) | fait |
-| Détection de collisions | à faire |
+| Détection des rapprochements et collisions (déterministe) | fait |
+| Collisions probabilistes (méthode CUBE), pour les runs longs | à faire |
 | Modèle de fragmentation | à faire |
 | Traînée atmosphérique | à faire |
 
@@ -26,6 +27,7 @@ de collisions, fragmentation, cascade.
 .
 ├── src/
 │   ├── core/orbital.*      dynamique partagée : RK4, J2, Lune, entrées/sorties
+│   ├── core/collision.*    détection des rapprochements : grille + instant de rapprochement
 │   ├── main.cpp            simulation en ligne de commande
 │   └── viewer/viewer.cpp   viewer 3D temps réel (raylib + Dear ImGui)
 ├── scripts/
@@ -65,7 +67,7 @@ cmake --build build
 Sans CMake du tout, la simulation seule se compile en une ligne :
 
 ```bash
-g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/main.cpp -o kessler_sim
+g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/core/collision.cpp src/main.cpp -o kessler_sim
 ```
 
 Sur MSYS2, CMake s'installe avec :
@@ -99,6 +101,112 @@ kessler_sim [fichier] [durée_h] [pas_s] [période_sortie_s] [ids_norad]
 
 Tout est écrit dans `output/` : `final_state.csv`, les `snapshot_N.csv`, et
 `trajectories.csv` + `moon.csv` quand des identifiants sont donnés.
+
+## Rapprochements et collisions
+
+```bash
+./kessler_sim data/satellites_20260801_1000Z.txt 24 10 --conj-km 5
+```
+
+Détecte, pendant la propagation, tous les passages à moins de `--conj-km`
+kilomètres, et signale une collision quand la distance descend sous la somme
+des rayons des deux objets. Le détail va dans `output/conjunctions.csv` :
+instant, identifiants, distance de passage, vitesse relative.
+
+| Option | Défaut | Rôle |
+|---|---|---|
+| `--screen` | — | active la détection avec le seuil par défaut |
+| `--conj-km X` | 5 | seuil de rapprochement retenu (active la détection) |
+| `--radius-scale S` | 1 | multiplie tous les rayons de collision |
+| `--min-vrel V` | 10 | vitesse relative minimale d'une rencontre, en m/s |
+| `--threads N` | tous | nombre de threads OpenMP |
+
+**Principe.** Une grille de hachage ne retient que les paires assez proches en
+début de pas pour pouvoir se rencontrer pendant le pas — la taille de cellule
+suit la vitesse relative maximale fois le pas. Pour ces paires, l'instant de
+rapprochement maximal est calculé analytiquement, puis affiné par
+interpolation d'Hermite entre le début et la fin du pas.
+
+Le point clé : deux objets proches subissent presque la même gravité, donc
+leur mouvement *relatif* est quasi rectiligne sur un pas, même si leurs
+trajectoires absolues sont courbes. Une collision est détectée même si les
+deux objets se sont traversés entre deux pas — **la détection ne dépend pas du
+pas d'intégration**. Vérifié : sur 2 h, les 2 969 rapprochements trouvés à
+10 s de pas le sont tous à 1 s, appariés un pour un, avec au plus 9 mm d'écart
+sur la distance et 5 µs sur l'instant.
+
+**Rayons de collision.** Le catalogue ne donne qu'une catégorie de section
+radar : 0,1 m (SMALL), 0,4 m (MEDIUM, et objets sans catégorie), 2 m (LARGE).
+Valeurs indicatives, à calibrer ; `--radius-scale` les multiplie toutes.
+
+**Paires volant de concert.** Deux objets lancés ensemble peuvent voler à
+quelques centaines de mètres l'un de l'autre, à quelques m/s relatifs. Leur
+distance varie à peine d'un pas à l'autre, l'instant de rapprochement n'est pas
+défini, et un contact ne serait de toute façon pas une fragmentation
+hypervéloce. Sous `--min-vrel`, ces paires sont comptées à part au lieu d'être
+traitées comme des rencontres.
+
+### Premier bilan sur 24 h
+
+| Distance de passage | Rapprochements |
+|---|---|
+| < 5 km | 38 367 |
+| < 1 km | 1 493 |
+| < 100 m | 14 |
+| collision (rayons réels) | 0 |
+
+Le plus serré : 7,2 m entre STARLINK-3051 et STARLINK-34756. Vitesse relative
+médiane : 11,5 km/s.
+
+Le nombre de passages à moins de *d* croît comme *d²* — ~1 500 par km² et par
+jour, constant de 100 m à 5 km. C'est ce qu'on attend si les distances de
+passage se répartissent au hasard dans le plan de rencontre, et cela donne un
+ordre de grandeur direct du taux de collision :
+
+> taux ≈ 1 500 × (R₁ + R₂)² par jour, avec R en km
+
+Avec des rayons cumulés d'un mètre, environ 0,5 collision par an. Multiplier
+les rayons par *S* (`--radius-scale`) multiplie ce taux par *S²*.
+
+**Limite importante.** Les états initiaux viennent de TLE propagés par SGP4,
+dont l'erreur de position est de l'ordre du kilomètre. Chaque rapprochement
+individuel n'a donc rien d'une prédiction réelle : ce sont les statistiques
+qui sont représentatives, pas les événements.
+
+### Coût et parallélisation
+
+Mesures sur i7-11800H (8 cœurs, 16 threads logiques), 1 h simulée à dt = 10 s,
+configurations alternées pour annuler la dérive thermique :
+
+| Threads | Propagation | Grille | Paires | Total |
+|---|---|---|---|---|
+| 1 | 0,587 s | 0,470 s | 2,609 s | 3,67 s |
+| 8 | 0,156 s | 0,509 s | 0,437 s | 1,10 s |
+| 16 | 0,120 s | 0,511 s | 0,301 s | 0,93 s |
+
+La propagation accélère 4,9 fois, le parcours des paires 8,7 fois.
+**La construction de la grille est séquentielle et ne gagne rien** : à
+16 threads elle représente plus de la moitié du temps total, c'est le facteur
+limitant au sens d'Amdahl.
+
+**Le pas optimal n'est pas le plus petit.** Le coût de la propagation varie en
+1/dt, mais les cellules doivent grandir avec le pas, donc les paires candidates
+croissent en dt³ et le parcours en dt². Sur 6 h simulées :
+
+| Pas | Total | Paires candidates/pas | Écart de distance vs dt = 10 s |
+|---|---|---|---|
+| 10 s | 6,6 s | 124 000 | référence |
+| **30 s** | **3,4 s** | 1 690 000 | médian 1 cm, max 5,9 m |
+| 60 s | 5,5 s | 7 500 000 | médian 16 cm, max 131 m |
+| 120 s | 25,6 s | 31 800 000 | — |
+
+Les 9 033 rapprochements sont les mêmes à 10, 30 et 60 s : seule la précision
+des distances se dégrade. Donc **dt = 30 s pour les runs longs**, dt = 10 s
+quand la distance exacte compte.
+
+À dt = 30 s : environ 14 s par jour simulé, soit ~1 h 25 par année simulée.
+Attention, le coût du parcours croît en N², pas en N : une cascade qui
+multiplierait le nombre d'objets par 4 multiplierait ce terme par 16.
 
 ## Viewer 3D
 
@@ -138,6 +246,26 @@ d'objets affichés se met à jour en direct.
 inclinaison, excentricité, période, vitesse). Le bouton *Suivre* trace son
 orbite complète et l'étiquette dans la vue ; *Caméra liée* centre la vue
 dessus. Plusieurs objets peuvent être suivis en même temps.
+
+**Rapprochements en direct.** En mode Live, le panneau *Rapprochements* active
+la détection pendant que la simulation tourne. Chaque passage sous le seuil
+trace un segment entre les deux objets, qui s'efface en quelques secondes —
+rouge s'il s'agit d'une collision. La liste donne distance, noms, instant et
+vitesse relative ; un clic sélectionne l'objet et y accroche la caméra. Le
+seuil et le facteur de rayon se règlent sans interrompre la simulation.
+
+La détection coûte ~2 ms par pas, et elle tourne à *chaque* pas — c'est la
+condition pour ne rien rater. Avec 6 pas par image, comptez ~15 ms par image :
+le panneau affiche le coût et prévient quand il devient sensible.
+
+**Débogage de la grille.** La case *Debug : grille de détection* trace les
+cellules. Avec un objet sélectionné, elle montre sa cellule et les 26 voisines,
+c'est-à-dire exactement le voisinage examiné ; sans sélection, les cellules
+occupées les plus proches de la caméra.
+
+**État de départ**, pratique pour scripter : `--play` lance la propagation,
+`--detect` active aussi la détection, `--grid` affiche la grille, et
+`--radius-scale S` multiplie les rayons de collision.
 
 Le viewer écrit un `imgui.ini` à la racine pour mémoriser la disposition des
 panneaux. Il est dans le `.gitignore` ; le supprimer rétablit la disposition

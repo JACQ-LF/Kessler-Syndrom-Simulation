@@ -16,15 +16,23 @@
 // Utilisation, DEPUIS LA RACINE DU DEPOT :
 //   kessler_viewer [fichier_catalogue]
 //   kessler_viewer --screenshot vue.png [--frames N]   (rendu hors interaction)
+//
+// Etat de depart, pratique pour scripter : --play (lance la propagation),
+// --detect (active aussi la detection), --grid (affiche la grille),
+// --radius-scale S.
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "raylib.h"
@@ -38,7 +46,9 @@
 // de raymath : liberer le nom maintenant ne leur retire rien.
 #undef PI
 
+#include "core/collision.hpp"
 #include "core/orbital.hpp"
+#include "core/threads.hpp"
 
 using namespace kessler;
 
@@ -187,6 +197,49 @@ struct App {
 
     int visible_count = 0;
     int type_visible[TYPE_COUNT] = {};
+
+    // --- Detection des rapprochements (mode Live seulement) ---
+    bool detect = false;
+    bool show_grid = false;          // trace les cellules de la grille de detection
+    ScreeningConfig screen_cfg;
+    std::vector<State> before;       // etats en debut de pas, pour screen_step
+    ScreeningStats last_stats;
+    double detect_ms = 0.0;          // moyenne glissante, par pas
+    long long total_conj = 0, total_coll = 0;
+
+    // Un rapprochement signale dans la vue : les objets s'eloignent ensuite,
+    // donc on memorise leurs positions a l'instant du signalement.
+    struct Event {
+        int i = 0, j = 0;
+        double t = 0, miss_km = 0, v_rel = 0;
+        bool collision = false;
+        Vec3 ri, rj;
+        float age = 0.0f;            // secondes ecoulees a l'ecran
+    };
+    std::deque<Event> events;        // le plus recent en tete
+    float event_lifetime = 4.0f;
+
+    void run_detection(double t0) {
+        auto c0 = std::chrono::steady_clock::now();
+        std::vector<Conjunction> found =
+            screen_step(before, sim.objects, t0, sim.dt, screen_cfg, &last_stats);
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - c0).count();
+        detect_ms = detect_ms > 0 ? 0.9 * detect_ms + 0.1 * ms : ms;
+
+        for (const Conjunction& c : found) {
+            Event e;
+            e.i = c.i; e.j = c.j; e.t = c.t;
+            e.miss_km = c.miss_km; e.v_rel = c.v_rel_km_s;
+            e.collision = c.collision;
+            e.ri = sim.objects[c.i].s.r;
+            e.rj = sim.objects[c.j].s.r;
+            events.push_front(e);
+            ++total_conj;
+            if (c.collision) ++total_coll;
+        }
+        while (events.size() > 200) events.pop_back();
+    }
 
     void reset() {
         for (size_t i = 0; i < sim.objects.size(); ++i) {
@@ -410,6 +463,150 @@ void draw_filters_panel(App& app) {
     ImGui::End();
 }
 
+// Distance lisible : metres en dessous du kilometre.
+std::string format_distance(double km) {
+    char buf[32];
+    if (km < 1.0) std::snprintf(buf, sizeof(buf), "%.0f m", km * 1000.0);
+    else std::snprintf(buf, sizeof(buf), "%.2f km", km);
+    return buf;
+}
+
+void draw_detection_panel(App& app) {
+    ImGui::SetNextWindowPos({GetScreenWidth() - 380.0f, 10}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({370, 520}, ImGuiCond_FirstUseEver);
+    ImGui::Begin("Rapprochements");
+
+    if (app.replay_mode) {
+        ImGui::TextWrapped("La detection a besoin des etats en debut et en fin de pas : "
+                           "elle n'est disponible qu'en mode Live.");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Checkbox("Detection active", &app.detect);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%.1f ms/pas)", app.detect_ms);
+    if (app.detect && app.steps_per_frame > 3)
+        ImGui::TextColored({1.0f, 0.75f, 0.3f, 1.0f},
+                           "%d pas par image : ~%.0f ms d'analyse par image.",
+                           app.steps_per_frame, app.detect_ms * app.steps_per_frame);
+
+    ImGui::PushItemWidth(140);
+    float seuil = static_cast<float>(app.screen_cfg.threshold_km);
+    if (ImGui::SliderFloat("Seuil (km)", &seuil, 0.1f, 50.0f, "%.1f",
+                           ImGuiSliderFlags_Logarithmic))
+        app.screen_cfg.threshold_km = seuil;
+
+    float scale = static_cast<float>(app.screen_cfg.radius_scale);
+    if (ImGui::SliderFloat("Facteur de rayon", &scale, 1.0f, 10000.0f, "x%.0f",
+                           ImGuiSliderFlags_Logarithmic))
+        app.screen_cfg.radius_scale = scale;
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Multiplie les rayons de collision (0.1 / 0.4 / 2 m selon\n"
+                          "la taille radar). Le taux de collision croit comme le\n"
+                          "carre du facteur : x100 donne ~15 collisions par jour.");
+
+    ImGui::Checkbox("Debug : grille de detection", &app.show_grid);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Trace les cellules de la grille. Avec un objet selectionne,\n"
+                          "montre sa cellule et les 26 voisines reellement examinees.");
+
+    ImGui::Separator();
+    ImGui::Text("Total : %lld rapprochements, %lld collisions",
+                app.total_conj, app.total_coll);
+    ImGui::Text("Cellule %.0f km, %lld paires candidates/pas",
+                app.last_stats.cell_km, app.last_stats.candidate_pairs);
+    ImGui::TextDisabled("%lld paires volant de concert, ecartees",
+                        app.last_stats.co_orbiting);
+
+    ImGui::Separator();
+    if (ImGui::Button("Effacer")) {
+        app.events.clear();
+        app.total_conj = app.total_coll = 0;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("clic : selectionner et centrer");
+
+    ImGui::BeginChild("liste");
+    for (size_t k = 0; k < app.events.size(); ++k) {
+        const App::Event& e = app.events[k];
+        ImGui::PushID(static_cast<int>(k));
+        if (e.collision) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 90, 90, 255));
+        bool clicked = ImGui::Selectable(
+            (format_distance(e.miss_km) + "  " + app.sim.objects[e.i].name +
+             "  /  " + app.sim.objects[e.j].name).c_str());
+        if (e.collision) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("t = %.3f h\nvitesse relative %.2f km/s\n%s",
+                              e.t / 3600.0, e.v_rel,
+                              e.collision ? "COLLISION" : "passage");
+        if (clicked) {
+            app.selected = e.i;
+            app.follow_selected = true;
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+// Trace la grille de detection : la cellule de l'objet selectionne et ses 26
+// voisines — exactement le voisinage examine — ou, a defaut de selection, les
+// cellules occupees autour du point vise.
+void draw_grid_debug(const App& app) {
+    double cell = app.last_stats.cell_km;
+    if (cell <= 0) return;
+    float side = static_cast<float>(cell * SCALE);
+
+    auto cube = [&](int64_t ix, int64_t iy, int64_t iz, Color col) {
+        Vec3 c{(ix + 0.5) * cell, (iy + 0.5) * cell, (iz + 0.5) * cell};
+        DrawCubeWires(to_render(c), side, side, side, col);
+    };
+    auto cell_of = [&](const Vec3& r) {
+        return std::array<int64_t, 3>{{static_cast<int64_t>(std::floor(r.x / cell)),
+                                       static_cast<int64_t>(std::floor(r.y / cell)),
+                                       static_cast<int64_t>(std::floor(r.z / cell))}};
+    };
+
+    if (app.selected >= 0) {
+        auto c = cell_of(app.sim.objects[app.selected].s.r);
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz)
+                    cube(c[0] + dx, c[1] + dy, c[2] + dz,
+                         (dx || dy || dz) ? Color{70, 130, 180, 90} : Color{120, 230, 160, 220});
+        return;
+    }
+
+    // Sans selection : les cellules occupees les plus proches de la camera,
+    // plafonnees pour ne pas noyer la vue. Centrer sur le point vise ne
+    // montrerait rien, celui-ci etant au centre de la Terre par defaut.
+    Camera3D c3d = app.cam.to_camera3d();
+    Vec3 eye{c3d.position.x / SCALE, c3d.position.z / SCALE, c3d.position.y / SCALE};
+
+    std::unordered_set<uint64_t> seen;
+    std::vector<std::pair<double, std::array<int64_t, 3>>> occupied;
+    for (size_t i = 0; i < app.sim.objects.size(); ++i) {
+        if (!app.visible[i]) continue;
+        auto c = cell_of(app.sim.objects[i].s.r);
+        uint64_t key = (uint64_t(c[0] + 1048576) << 42) | (uint64_t(c[1] + 1048576) << 21)
+                     | uint64_t(c[2] + 1048576);
+        if (!seen.insert(key).second) continue;
+        Vec3 centre{(c[0] + 0.5) * cell, (c[1] + 0.5) * cell, (c[2] + 0.5) * cell};
+        occupied.push_back({norm(centre - eye), c});
+    }
+
+    const size_t cap = 300;
+    if (occupied.size() > cap)
+        std::nth_element(occupied.begin(), occupied.begin() + cap, occupied.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    size_t count = std::min(cap, occupied.size());
+    for (size_t k = 0; k < count; ++k)
+        cube(occupied[k].second[0], occupied[k].second[1], occupied[k].second[2],
+             {70, 130, 180, 80});
+}
+
 void draw_selection_panel(App& app) {
     place_panel(600, 290);
     ImGui::Begin("Selection");
@@ -501,14 +698,28 @@ int main(int argc, char** argv) {
     std::string screenshot;
     int screenshot_frames = 45;
 
+    bool start_play = false, start_detect = false, start_grid = false;
+    double start_scale = 1.0;
+    int threads = 0;   // 0 = defaut (coeurs physiques)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--screenshot" && i + 1 < argc) screenshot = argv[++i];
         else if (a == "--frames" && i + 1 < argc) screenshot_frames = std::atoi(argv[++i]);
+        else if (a == "--play") start_play = true;
+        else if (a == "--detect") { start_detect = true; start_play = true; }
+        else if (a == "--grid") start_grid = true;
+        else if (a == "--radius-scale" && i + 1 < argc) start_scale = std::atof(argv[++i]);
+        else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (!a.empty() && a[0] != '-') catalog = a;
     }
 
+    int used_threads = configure_threads(threads);
+
     App app;
+    app.playing = start_play;
+    app.detect = start_detect;
+    app.show_grid = start_grid;
+    app.screen_cfg.radius_scale = start_scale;
     app.catalog_path = catalog;
     int dropped = 0;
     app.sim.objects = load_catalog(catalog, &dropped);
@@ -523,7 +734,8 @@ int main(int argc, char** argv) {
     app.inc.resize(app.sim.objects.size());
     app.visible.assign(app.sim.objects.size(), 1);
     app.scan_snapshots();
-    std::printf("%zu objets charges (%d lignes ignorees).\n", app.sim.objects.size(), dropped);
+    std::printf("%zu objets charges (%d lignes ignorees), %d threads.\n",
+                app.sim.objects.size(), dropped, used_threads);
 
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1600, 900, "Kessler_Sim - viewer");
@@ -571,10 +783,24 @@ int main(int argc, char** argv) {
                 if (!app.snapshots.empty())
                     app.load_snapshot_at((app.snapshot_index + 1) %
                                          static_cast<int>(app.snapshots.size()));
+            } else if (app.detect) {
+                // Detection a chaque pas : c'est la condition pour ne rien
+                // rater, le TCA etant cherche a l'interieur du pas.
+                for (int k = 0; k < app.steps_per_frame; ++k) {
+                    app.before.resize(app.sim.objects.size());
+                    for (size_t i = 0; i < app.sim.objects.size(); ++i)
+                        app.before[i] = app.sim.objects[i].s;
+                    double t0 = app.sim.t;
+                    app.sim.step();
+                    app.run_detection(t0);
+                }
             } else {
                 app.sim.advance(app.steps_per_frame);
             }
         }
+
+        float dt_frame = GetFrameTime();
+        for (App::Event& e : app.events) e.age += dt_frame;
 
         app.refresh_derived();
 
@@ -619,6 +845,22 @@ int main(int argc, char** argv) {
             DrawSphereWires(p, pr * 4.0f, 6, 8, WHITE);
         }
 
+        // Rapprochements recents : un segment entre les deux objets, qui
+        // s'efface en quelques secondes. Rouge pour une collision.
+        for (const App::Event& e : app.events) {
+            if (e.age > app.event_lifetime) continue;
+            float f = 1.0f - e.age / app.event_lifetime;
+            Color col = e.collision
+                ? Color{255, 70, 70, static_cast<unsigned char>(255 * f)}
+                : Color{255, 235, 130, static_cast<unsigned char>(210 * f)};
+            Vector3 a = to_render(e.ri), b = to_render(e.rj);
+            DrawLine3D(a, b, col);
+            DrawSphereWires({(a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2},
+                            pr * (e.collision ? 6.0f : 3.0f), 5, 6, col);
+        }
+
+        if (app.show_grid) draw_grid_debug(app);
+
         // Lune, a l'echelle et a sa vraie position
         Vector3 moon = to_render(app.sim.moon());
         DrawSphere(moon, static_cast<float>(R_MOON) * SCALE, {190, 190, 185, 255});
@@ -641,6 +883,7 @@ int main(int argc, char** argv) {
         draw_simulation_panel(app);
         draw_filters_panel(app);
         draw_selection_panel(app);
+        draw_detection_panel(app);
         rlImGuiEnd();
 
         EndDrawing();
