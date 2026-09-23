@@ -48,6 +48,7 @@
 
 #include "core/collision.hpp"
 #include "core/orbital.hpp"
+#include "core/threads.hpp"
 
 using namespace kessler;
 
@@ -699,6 +700,7 @@ int main(int argc, char** argv) {
 
     bool start_play = false, start_detect = false, start_grid = false;
     double start_scale = 1.0;
+    int threads = 0;   // 0 = defaut (coeurs physiques)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--screenshot" && i + 1 < argc) screenshot = argv[++i];
@@ -707,8 +709,11 @@ int main(int argc, char** argv) {
         else if (a == "--detect") { start_detect = true; start_play = true; }
         else if (a == "--grid") start_grid = true;
         else if (a == "--radius-scale" && i + 1 < argc) start_scale = std::atof(argv[++i]);
+        else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (!a.empty() && a[0] != '-') catalog = a;
     }
+
+    int used_threads = configure_threads(threads);
 
     App app;
     app.playing = start_play;
@@ -729,7 +734,8 @@ int main(int argc, char** argv) {
     app.inc.resize(app.sim.objects.size());
     app.visible.assign(app.sim.objects.size(), 1);
     app.scan_snapshots();
-    std::printf("%zu objets charges (%d lignes ignorees).\n", app.sim.objects.size(), dropped);
+    std::printf("%zu objets charges (%d lignes ignorees), %d threads.\n",
+                app.sim.objects.size(), dropped, used_threads);
 
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1600, 900, "Kessler_Sim - viewer");

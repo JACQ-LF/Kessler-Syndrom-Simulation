@@ -119,6 +119,7 @@ instant, identifiants, distance de passage, vitesse relative.
 | `--conj-km X` | 5 | seuil de rapprochement retenu (active la détection) |
 | `--radius-scale S` | 1 | multiplie tous les rayons de collision |
 | `--min-vrel V` | 10 | vitesse relative minimale d'une rencontre, en m/s |
+| `--threads N` | tous | nombre de threads OpenMP |
 
 **Principe.** Une grille de hachage ne retient que les paires assez proches en
 début de pas pour pouvoir se rencontrer pendant le pas — la taille de cellule
@@ -172,8 +173,40 @@ dont l'erreur de position est de l'ordre du kilomètre. Chaque rapprochement
 individuel n'a donc rien d'une prédiction réelle : ce sont les statistiques
 qui sont représentatives, pas les événements.
 
-**Coût.** 24 h simulées en ~90 s, dont ~75 s de détection. Environ 124 000
-paires candidates par pas, au lieu de 400 millions.
+### Coût et parallélisation
+
+Mesures sur i7-11800H (8 cœurs, 16 threads logiques), 1 h simulée à dt = 10 s,
+configurations alternées pour annuler la dérive thermique :
+
+| Threads | Propagation | Grille | Paires | Total |
+|---|---|---|---|---|
+| 1 | 0,587 s | 0,470 s | 2,609 s | 3,67 s |
+| 8 | 0,156 s | 0,509 s | 0,437 s | 1,10 s |
+| 16 | 0,120 s | 0,511 s | 0,301 s | 0,93 s |
+
+La propagation accélère 4,9 fois, le parcours des paires 8,7 fois.
+**La construction de la grille est séquentielle et ne gagne rien** : à
+16 threads elle représente plus de la moitié du temps total, c'est le facteur
+limitant au sens d'Amdahl.
+
+**Le pas optimal n'est pas le plus petit.** Le coût de la propagation varie en
+1/dt, mais les cellules doivent grandir avec le pas, donc les paires candidates
+croissent en dt³ et le parcours en dt². Sur 6 h simulées :
+
+| Pas | Total | Paires candidates/pas | Écart de distance vs dt = 10 s |
+|---|---|---|---|
+| 10 s | 6,6 s | 124 000 | référence |
+| **30 s** | **3,4 s** | 1 690 000 | médian 1 cm, max 5,9 m |
+| 60 s | 5,5 s | 7 500 000 | médian 16 cm, max 131 m |
+| 120 s | 25,6 s | 31 800 000 | — |
+
+Les 9 033 rapprochements sont les mêmes à 10, 30 et 60 s : seule la précision
+des distances se dégrade. Donc **dt = 30 s pour les runs longs**, dt = 10 s
+quand la distance exacte compte.
+
+À dt = 30 s : environ 14 s par jour simulé, soit ~1 h 25 par année simulée.
+Attention, le coût du parcours croît en N², pas en N : une cascade qui
+multiplierait le nombre d'objets par 4 multiplierait ce terme par 16.
 
 ## Viewer 3D
 

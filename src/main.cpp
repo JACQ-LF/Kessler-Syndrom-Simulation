@@ -21,6 +21,8 @@
 //   --radius-scale S     multiplie les rayons de collision (defaut 1)
 //   --min-vrel V         vitesse relative minimale d'une rencontre, en m/s (defaut 10) ;
 //                        en dessous, la paire vole de concert et n'est pas une rencontre
+//   --threads N          nombre de threads (defaut : coeurs physiques ; l'hyper-threading
+//                        ralentit ces boucles)
 //
 // Les fichiers produits vont dans output/.
 
@@ -38,6 +40,7 @@
 
 #include "core/collision.hpp"
 #include "core/orbital.hpp"
+#include "core/threads.hpp"
 
 using namespace kessler;
 
@@ -56,6 +59,7 @@ std::string csv_quote(const std::string& s) {
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
     bool screen = false;
+    int threads = 0;   // 0 = defaut (coeurs physiques)
     ScreeningConfig scfg;
     for (int k = 1; k < argc; ++k) {
         std::string a = argv[k];
@@ -66,6 +70,8 @@ int main(int argc, char** argv) {
             screen = true;
         } else if (a == "--radius-scale" && k + 1 < argc) {
             scfg.radius_scale = std::atof(argv[++k]);
+        } else if (a == "--threads" && k + 1 < argc) {
+            threads = std::atoi(argv[++k]);
         } else if (a == "--min-vrel" && k + 1 < argc) {
             scfg.min_encounter_speed_km_s = std::atof(argv[++k]) * 1e-3;  // saisi en m/s
         } else if (a.rfind("--", 0) == 0) {
@@ -91,6 +97,7 @@ int main(int argc, char** argv) {
     }
 
     std::filesystem::create_directories(OUT_DIR);
+    int used_threads = configure_threads(threads);
 
     Simulation sim;
     int dropped = 0;
@@ -106,6 +113,7 @@ int main(int argc, char** argv) {
 
     std::cout << sim.objects.size() << " objets charges. Duree " << duration / 3600.0
               << " h, pas " << dt << " s\n"
+              << "Threads : " << used_threads << "\n"
               << "Epoch : " << jd_to_utc_string(sim.epoch_jd) << "\n"
               << "Lune a l'epoch : distance " << norm(sim.moon()) << " km\n";
 
