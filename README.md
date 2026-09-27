@@ -217,6 +217,24 @@ quand la distance exacte compte.
 Attention, le coût du parcours croît en N², pas en N : une cascade qui
 multiplierait le nombre d'objets par 4 multiplierait ce terme par 16.
 
+**Profil d'exécution.** Dès que la détection tourne, `kessler_sim` affiche en
+fin de run où part le temps, et écrit `output/profile.csv` heure par heure :
+propagation, grille, parcours des paires, nombre moyen de threads réellement
+occupés pendant ce parcours, fragmentation, et population de la cellule la
+plus chargée. Deux régimes ressortent :
+
+| Phase | Catalogue seul (2 h) | Cascade ×100 (12 h) |
+|---|---|---|
+| Parcours des paires | 30 % | 83 % |
+| Grille (séquentielle) | 48 % | 9 % |
+| Threads occupés sur les paires | 13,9 / 16 | 12,6 / 16 |
+| Cellule la plus peuplée | 13 objets | 1 837 objets |
+
+Sur le catalogue seul, la moitié du temps est séquentielle : le CPU plafonne
+autour de 45 % d'occupation. En cascade, le parcours domine, mais un nuage de
+fragments frais s'entasse dans quelques cellules et chaque cellule n'est
+traitée que par un seul thread : un quart des threads attend.
+
 ## Fragmentation
 
 ```bash

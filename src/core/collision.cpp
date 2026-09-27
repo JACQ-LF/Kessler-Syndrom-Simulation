@@ -254,30 +254,45 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
         {0, 0, 1}};
 
     const int ncells = static_cast<int>(grid.cells.size());
-    #pragma omp parallel for schedule(dynamic, 64) reduction(+ : candidates, refined, co_orbiting)
-    for (int c = 0; c < ncells; ++c) {
+
+    // Cellule la plus peuplee : un nuage de fragments frais s'y entasse, et
+    // une cellule n'est traitee que par un seul thread.
+    int max_cell = 0;
+    for (const CellGrid::Cell& cc : grid.cells) max_cell = std::max(max_cell, cc.end - cc.begin);
+
+    // Temps de travail effectif de chaque thread : la difference avec
+    // l'horloge murale mesure l'attente, donc le desequilibre de charge.
+    std::vector<double> busy(nthreads, 0.0);
+    #pragma omp parallel
+    {
         int tid = 0;
 #ifdef _OPENMP
         tid = omp_get_thread_num();
 #endif
+        auto t_thread = std::chrono::steady_clock::now();
         std::vector<Conjunction>& out = found[tid];
-        const CellGrid::Cell& cc = grid.cells[c];
 
-        auto visit = [&](int a, int b) {
-            ++candidates;
-            int r = test_pair(a, b, out);
-            if (r == 1) ++refined;
-            else if (r == 2) ++co_orbiting;
-        };
+        #pragma omp for schedule(dynamic, 64) reduction(+ : candidates, refined, co_orbiting) nowait
+        for (int c = 0; c < ncells; ++c) {
+            const CellGrid::Cell& cc = grid.cells[c];
 
-        for (int p = cc.begin; p < cc.end; ++p)
-            for (int q = p + 1; q < cc.end; ++q) visit(order[p], order[q]);
+            auto visit = [&](int a, int b) {
+                ++candidates;
+                int r = test_pair(a, b, out);
+                if (r == 1) ++refined;
+                else if (r == 2) ++co_orbiting;
+            };
 
-        for (const auto& o : FORWARD) {
-            auto range = grid.find(cell_key(cc.x + o[0], cc.y + o[1], cc.z + o[2]));
             for (int p = cc.begin; p < cc.end; ++p)
-                for (int q = range.first; q < range.second; ++q) visit(order[p], order[q]);
+                for (int q = p + 1; q < cc.end; ++q) visit(order[p], order[q]);
+
+            for (const auto& o : FORWARD) {
+                auto range = grid.find(cell_key(cc.x + o[0], cc.y + o[1], cc.z + o[2]));
+                for (int p = cc.begin; p < cc.end; ++p)
+                    for (int q = range.first; q < range.second; ++q) visit(order[p], order[q]);
+            }
         }
+        busy[tid] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_thread).count();
     }
 
     auto t_pairs = std::chrono::steady_clock::now();
@@ -294,6 +309,11 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
         stats->cell_km = cell;
         stats->grid_s = std::chrono::duration<double>(t_grid - t_start).count();
         stats->pairs_s = std::chrono::duration<double>(t_pairs - t_grid).count();
+        stats->pairs_busy_s = 0.0;
+        for (double b : busy) stats->pairs_busy_s += b;
+        stats->threads = nthreads;
+        stats->max_cell_objects = max_cell;
+        stats->max_cell_pairs = static_cast<long long>(max_cell) * (max_cell - 1) / 2;
     }
     return out;
 }

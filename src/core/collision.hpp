@@ -43,7 +43,11 @@ struct ScreeningStats {
     long long co_orbiting = 0;      // paires sous le seuil de distance mais trop lentes pour une rencontre
     double cell_km = 0.0;           // taille de cellule retenue pour ce pas
     double grid_s = 0.0;            // temps de construction de la grille
-    double pairs_s = 0.0;           // temps de parcours des paires
+    double pairs_s = 0.0;           // temps de parcours des paires (horloge murale)
+    double pairs_busy_s = 0.0;      // somme des temps de travail des threads sur les paires
+    int threads = 1;                // threads engages dans le parcours
+    int max_cell_objects = 0;       // objets dans la cellule la plus peuplee
+    long long max_cell_pairs = 0;   // paires candidates issues de cette seule cellule
 };
 
 // Rayon de collision equivalent, en km : la moitie de la dimension

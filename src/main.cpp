@@ -232,6 +232,17 @@ int main(int argc, char** argv) {
     long long below[4] = {0, 0, 0, 0};           // < 0.1, < 1, < 2, < 5 km
     const double bins[4] = {0.1, 1.0, 2.0, 5.0};
     double t_prop = 0, t_screen = 0, t_grid = 0, t_pairs = 0;
+    // Profil d'execution : ou part le temps, et combien de threads travaillent
+    // vraiment pendant le parcours des paires.
+    double t_pairs_busy = 0, t_apply = 0, t_copy = 0;
+    int pair_threads = 1, max_cell_objects = 0;
+    std::ofstream prof_out;
+    if (screen) {
+        prof_out.open(OUT_DIR + "/profile.csv");
+        prof_out << "t_h,objects,propagation_s,grid_s,pairs_s,pairs_threads_busy,"
+                    "breakup_s,other_s,max_cell_objects\n";
+    }
+    struct { double loop = 0, prop = 0, grid = 0, pairs = 0, busy = 0, apply = 0; int max_cell = 0; } hour;
     if (breakup && !conj_explicit) {
         // En mode fragmentation, seules les collisions importent : le seuil
         // se cale sur la plus grande somme de rayons possible. Un seuil plus
@@ -316,14 +327,19 @@ int main(int argc, char** argv) {
     bool impact_done = impact_index < 0;
 
     using clock = std::chrono::steady_clock;
+    auto loop_start = clock::now();
+    long profiled_hour = 0;
     for (long n = 0; n < steps; ++n) {
+        auto step_start = clock::now();
         if (!impact_done && sim.t >= impact_at_h * 3600.0) {
             impact_done = true;
             log_breakup(frag.impact(sim, impact_index, impact_mass, impact_vrel));
         }
         if (screen) {
+            auto cc0 = clock::now();
             before.resize(sim.objects.size());
             for (size_t i = 0; i < sim.objects.size(); ++i) before[i] = sim.objects[i].s;
+            t_copy += std::chrono::duration<double>(clock::now() - cc0).count();
         }
         double t0 = sim.t;
 
@@ -331,6 +347,7 @@ int main(int argc, char** argv) {
         sim.step();
         auto c1 = clock::now();
         t_prop += std::chrono::duration<double>(c1 - c0).count();
+        hour.prop += std::chrono::duration<double>(c1 - c0).count();
 
         if (screen) {
             ScreeningStats st;
@@ -342,6 +359,13 @@ int main(int argc, char** argv) {
             cell_km = st.cell_km;
             t_grid += st.grid_s;
             t_pairs += st.pairs_s;
+            t_pairs_busy += st.pairs_busy_s;
+            pair_threads = st.threads;
+            max_cell_objects = std::max(max_cell_objects, st.max_cell_objects);
+            hour.grid += st.grid_s;
+            hour.pairs += st.pairs_s;
+            hour.busy += st.pairs_busy_s;
+            hour.max_cell = std::max(hour.max_cell, st.max_cell_objects);
             for (const Conjunction& c : found) {
                 const Object& a = sim.objects[c.i];
                 const Object& b = sim.objects[c.j];
@@ -355,9 +379,25 @@ int main(int argc, char** argv) {
                     closest = c.miss_km; closest_i = c.i; closest_j = c.j; t_closest = c.t;
                 }
             }
-            if (breakup)
+            if (breakup) {
+                auto a0 = clock::now();
                 for (const BreakupEvent& ev : frag.apply(sim, before, t0, sim.dt, found))
                     log_breakup(ev);
+                double da = std::chrono::duration<double>(clock::now() - a0).count();
+                t_apply += da;
+                hour.apply += da;
+            }
+        }
+
+        hour.loop += std::chrono::duration<double>(clock::now() - step_start).count();
+        if (screen && static_cast<long>(sim.t / 3600.0) > profiled_hour) {
+            profiled_hour = static_cast<long>(sim.t / 3600.0);
+            double other = hour.loop - hour.prop - hour.grid - hour.pairs - hour.apply;
+            prof_out << profiled_hour << ',' << sim.objects.size() << ',' << hour.prop << ','
+                     << hour.grid << ',' << hour.pairs << ','
+                     << (hour.pairs > 0 ? hour.busy / hour.pairs : 0.0) << ',' << hour.apply
+                     << ',' << other << ',' << hour.max_cell << std::endl;
+            hour = {};
         }
 
         if (breakup && static_cast<long>(sim.t / 3600.0) > last_logged_hour) {
@@ -374,6 +414,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    double t_loop = std::chrono::duration<double>(clock::now() - loop_start).count();
     write_snapshot(OUT_DIR + "/final_state.csv", sim.objects, sim.t);
 
     // Bilan sur les objets du catalogue (les fragments n'ont pas d'etat initial).
@@ -416,6 +457,26 @@ int main(int argc, char** argv) {
                   << "Temps : propagation " << t_prop << " s, detection " << t_screen
                   << " s (grille " << t_grid << " s, paires " << t_pairs << " s)\n"
                   << "Detail dans " << OUT_DIR << "/conjunctions.csv\n";
+    }
+
+    if (screen) {
+        // Ou part le temps, et ce que les threads font pendant le parcours.
+        double seq = t_grid + t_apply + t_copy;
+        double other = t_loop - t_prop - t_grid - t_pairs - t_apply - t_copy;
+        std::cout << std::fixed << std::setprecision(1)
+                  << "\n--- Profil d'execution (" << t_loop << " s au total) ---\n"
+                  << "  propagation        " << t_prop << " s  (" << 100 * t_prop / t_loop << " %)\n"
+                  << "  parcours des paires " << t_pairs << " s  (" << 100 * t_pairs / t_loop
+                  << " %), " << (t_pairs > 0 ? t_pairs_busy / t_pairs : 0.0) << " threads sur "
+                  << pair_threads << " occupes en moyenne\n"
+                  << "  grille (sequentiel) " << t_grid << " s  (" << 100 * t_grid / t_loop << " %)\n"
+                  << "  fragmentation      " << t_apply << " s  (" << 100 * t_apply / t_loop << " %)\n"
+                  << "  copie des etats    " << t_copy << " s\n"
+                  << "  reste (journaux)   " << other << " s\n"
+                  << "  phases sequentielles : " << 100 * seq / t_loop << " % du temps\n"
+                  << "  cellule la plus peuplee : " << max_cell_objects << " objets\n"
+                  << "Detail heure par heure dans " << OUT_DIR << "/profile.csv\n"
+                  << std::defaultfloat << std::setprecision(6);
     }
 
     if (breakup) {
