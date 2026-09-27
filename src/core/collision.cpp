@@ -217,6 +217,16 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
         // Trop lente pour une rencontre : voir ScreeningConfig.
         if (dv2 < vmin2) return 2;
 
+        // Paire qui s'eloigne deja en debut de pas. Si sa trajectoire
+        // relative est convexe sur le pas, la distance est minimale au debut
+        // du pas : le rapprochement, s'il y en a eu un, appartient au pas
+        // precedent, et l'affinage ne ferait que le confirmer. La derivee
+        // seconde de |p|^2 vaut 2 |dv|^2 + 2 dr.a, avec |a| <= G |dr| : elle
+        // est positive des que |dv|^2 > G |dr|^2, ce qu'on verifie. Juste
+        // apres une fragmentation, c'est le cas de toutes les paires de
+        // fragments freres : les affiner toutes coutait 58 fois un pas normal.
+        if (dot(dr, dv) >= 0.0 && dv2 > GRAVITY_GRADIENT * dot(dr, dr)) return 0;
+
         // Affinage : interpolation d'Hermite entre debut et fin de pas.
         Hermite h{dr, dv * dt,
                   after[j].s.r - after[i].s.r,
@@ -260,6 +270,29 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
     int max_cell = 0;
     for (const CellGrid::Cell& cc : grid.cells) max_cell = std::max(max_cell, cc.end - cc.begin);
 
+    // Decoupage du travail par OBJETS plutot que par cellules : une cellule
+    // surpeuplee (un nuage de fragments frais) donnerait sinon tout son
+    // travail a un seul thread. Chaque cellule est coupee en paquets d'au
+    // plus CHUNK objets ; un paquet traite les paires de ses objets avec la
+    // suite de la cellule et avec les 13 voisines en avant. La plupart des
+    // cellules tiennent en un paquet : rien ne change pour elles.
+    // Les paquets des cellules surpeuplees passent en tete de liste, pour
+    // etre distribues un par un entre tous les threads plutot que par lots.
+    constexpr int CHUNK = 16;
+    struct Work { int cell, begin, end; };
+    std::vector<Work> work, light;
+    work.reserve(64);
+    light.reserve(grid.cells.size());
+    for (int c = 0; c < ncells; ++c) {
+        const CellGrid::Cell& cc = grid.cells[c];
+        std::vector<Work>& dst = (cc.end - cc.begin > CHUNK) ? work : light;
+        for (int p = cc.begin; p < cc.end; p += CHUNK)
+            dst.push_back({c, p, std::min(p + CHUNK, cc.end)});
+    }
+    const int nheavy = static_cast<int>(work.size());
+    work.insert(work.end(), light.begin(), light.end());
+    const int nwork = static_cast<int>(work.size());
+
     // Temps de travail effectif de chaque thread : la difference avec
     // l'horloge murale mesure l'attente, donc le desequilibre de charge.
     std::vector<double> busy(nthreads, 0.0);
@@ -272,27 +305,43 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
         auto t_thread = std::chrono::steady_clock::now();
         std::vector<Conjunction>& out = found[tid];
 
-        #pragma omp for schedule(dynamic, 64) reduction(+ : candidates, refined, co_orbiting) nowait
-        for (int c = 0; c < ncells; ++c) {
-            const CellGrid::Cell& cc = grid.cells[c];
-
-            auto visit = [&](int a, int b) {
-                ++candidates;
-                int r = test_pair(a, b, out);
-                if (r == 1) ++refined;
-                else if (r == 2) ++co_orbiting;
-            };
-
-            for (int p = cc.begin; p < cc.end; ++p)
+        // Compteurs propres au thread, sommes une seule fois en sortie : des
+        // compteurs partages incrementes par 16 threads a la fois seraient
+        // faux (acces concurrents) et lents (une meme ligne de cache).
+        long long my_candidates = 0, my_refined = 0, my_co_orbiting = 0;
+        auto visit = [&](int a, int b) {
+            ++my_candidates;
+            int r = test_pair(a, b, out);
+            if (r == 1) ++my_refined;
+            else if (r == 2) ++my_co_orbiting;
+        };
+        auto process = [&](const Work& wk) {
+            const CellGrid::Cell& cc = grid.cells[wk.cell];
+            // Paires internes a la cellule : chaque objet du paquet avec les
+            // objets qui le suivent dans la cellule.
+            for (int p = wk.begin; p < wk.end; ++p)
                 for (int q = p + 1; q < cc.end; ++q) visit(order[p], order[q]);
-
             for (const auto& o : FORWARD) {
                 auto range = grid.find(cell_key(cc.x + o[0], cc.y + o[1], cc.z + o[2]));
-                for (int p = cc.begin; p < cc.end; ++p)
+                for (int p = wk.begin; p < wk.end; ++p)
                     for (int q = range.first; q < range.second; ++q) visit(order[p], order[q]);
             }
-        }
+        };
+
+        // Paquets lourds un par un, puis le reste par lots (moins de
+        // synchronisation pour des milliers de petites cellules).
+        #pragma omp for schedule(dynamic, 1) nowait
+        for (int w = 0; w < nheavy; ++w) process(work[w]);
+        #pragma omp for schedule(dynamic, 32) nowait
+        for (int w = nheavy; w < nwork; ++w) process(work[w]);
         busy[tid] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_thread).count();
+
+        #pragma omp atomic
+        candidates += my_candidates;
+        #pragma omp atomic
+        refined += my_refined;
+        #pragma omp atomic
+        co_orbiting += my_co_orbiting;
     }
 
     auto t_pairs = std::chrono::steady_clock::now();

@@ -225,15 +225,32 @@ plus chargée. Deux régimes ressortent :
 
 | Phase | Catalogue seul (2 h) | Cascade ×100 (12 h) |
 |---|---|---|
-| Parcours des paires | 30 % | 83 % |
-| Grille (séquentielle) | 48 % | 9 % |
-| Threads occupés sur les paires | 13,9 / 16 | 12,6 / 16 |
+| Parcours des paires | 30 % | 77 % |
+| Grille (séquentielle) | 48 % | 12 % |
+| Threads occupés sur les paires | 13,9 / 16 | 15,5 / 16 |
 | Cellule la plus peuplée | 13 objets | 1 837 objets |
 
 Sur le catalogue seul, la moitié du temps est séquentielle : le CPU plafonne
-autour de 45 % d'occupation. En cascade, le parcours domine, mais un nuage de
-fragments frais s'entasse dans quelques cellules et chaque cellule n'est
-traitée que par un seul thread : un quart des threads attend.
+autour de 45 % d'occupation. Paralléliser la construction de la grille est la
+prochaine étape de ce côté.
+
+**Le pic après une fragmentation.** Juste après une collision, les fragments
+sont entassés dans une seule cellule. Au pas qui suivait un impact de 519
+fragments, le parcours des paires passait de 0,9 ms à **48,8 ms**, avec 1,2
+thread au travail sur 16. Deux causes, deux corrections :
+
+- **Travail inutile.** Les 134 000 paires de fragments frères passaient toutes
+  le filtre linéaire et partaient en affinage, alors qu'elles s'éloignent
+  toutes. Une paire qui s'éloigne en début de pas, sur une trajectoire relative
+  convexe, a son minimum au début du pas : elle est écartée sans affinage. La
+  convexité est vérifiée explicitement (|Δv|² > G·|Δr|²). 48,8 → 2,1 ms.
+- **Répartition par espace.** Une cellule était traitée par un seul thread. Le
+  travail est désormais découpé par objets : chaque cellule est coupée en
+  paquets de 16, les paquets des cellules surpeuplées passent en tête et sont
+  distribués un par un. 2,1 → 1,0 ms — le pas qui suit un impact coûte
+  autant qu'un pas ordinaire.
+
+Résultats inchangés au bit près : mêmes rapprochements, même cascade.
 
 ## Fragmentation
 
