@@ -16,15 +16,24 @@
 // Utilisation, DEPUIS LA RACINE DU DEPOT :
 //   kessler_viewer [fichier_catalogue]
 //   kessler_viewer --screenshot vue.png [--frames N]   (rendu hors interaction)
+//
+// Etat de depart, pratique pour scripter : --play (lance la propagation),
+// --detect (active aussi la detection), --breakup (et la fragmentation),
+// --grid (affiche la grille), --radius-scale S, --masses FICHIER,
+// --impact NORAD [--impact-mass KG] [--impact-vrel KMS] (impact au demarrage).
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "raylib.h"
@@ -38,7 +47,10 @@
 // de raymath : liberer le nom maintenant ne leur retire rien.
 #undef PI
 
+#include "core/breakup.hpp"
+#include "core/collision.hpp"
 #include "core/orbital.hpp"
+#include "core/threads.hpp"
 
 using namespace kessler;
 
@@ -51,12 +63,26 @@ constexpr float SCALE = 0.001f;
 
 constexpr int TYPE_COUNT = static_cast<int>(ObjectType::Count);
 
-const Color TYPE_COLOR[TYPE_COUNT] = {
+// Categories d'affichage : les quatre types du catalogue, plus les fragments
+// crees par la simulation, a part pour qu'un nuage se distingue a l'oeil.
+constexpr int FRAGMENT_CATEGORY = TYPE_COUNT;
+constexpr int CATEGORY_COUNT = TYPE_COUNT + 1;
+
+const Color CATEGORY_COLOR[CATEGORY_COUNT] = {
     {80, 160, 255, 255},   // PAYLOAD
     {235, 80, 70, 255},    // DEBRIS
     {255, 165, 50, 255},   // ROCKET BODY
     {170, 170, 170, 255},  // UNKNOWN
+    {225, 90, 255, 255},   // FRAGMENTS
 };
+
+int category_of(const Object& o) {
+    return o.is_fragment() ? FRAGMENT_CATEGORY : static_cast<int>(o.type);
+}
+
+const char* category_name(int c) {
+    return c == FRAGMENT_CATEGORY ? "FRAGMENTS" : object_type_name(static_cast<ObjectType>(c));
+}
 
 Vector3 to_render(const Vec3& v) {
     // ECI (x, y, z) -> raylib (x, z, y) : raylib a Y vers le haut, on met donc
@@ -118,7 +144,7 @@ struct OrbitCamera {
 // ---------------------------------------------------------------------------
 
 struct Filters {
-    bool type_on[TYPE_COUNT] = {true, true, true, true};
+    bool type_on[CATEGORY_COUNT] = {true, true, true, true, true};
     float alt_min = 0.0f;
     // Assez haut pour englober les rares objets en orbite lunaire (DRO-A est
     // a ~529 000 km) : par defaut, tout le catalogue doit etre affiche.
@@ -157,7 +183,7 @@ void main() { finalColor = colDiffuse; }
 
 struct App {
     Simulation sim;
-    std::vector<State> initial;     // pour la remise a zero
+    std::vector<Object> catalog;    // etat initial complet, pour la remise a zero
     std::string catalog_path;
 
     // Grandeurs recalculees a chaque image (filtrage et affichage).
@@ -186,14 +212,133 @@ struct App {
     bool follow_selected = false;
 
     int visible_count = 0;
-    int type_visible[TYPE_COUNT] = {};
+    int type_visible[CATEGORY_COUNT] = {};
+    int alive_fragments = 0;         // independamment des filtres
+
+    // --- Detection des rapprochements (mode Live seulement) ---
+    bool detect = false;
+    bool show_grid = false;          // trace les cellules de la grille de detection
+    ScreeningConfig screen_cfg;
+    std::vector<State> before;       // etats en debut de pas, pour screen_step
+    ScreeningStats last_stats;
+    double detect_ms = 0.0;          // moyenne glissante, par pas
+    long long total_conj = 0, total_coll = 0;
+
+    // Un rapprochement signale dans la vue : les objets s'eloignent ensuite,
+    // donc on memorise leurs positions a l'instant du signalement.
+    struct Event {
+        int i = 0, j = 0;
+        double t = 0, miss_km = 0, v_rel = 0;
+        bool collision = false;
+        Vec3 ri, rj;
+        float age = 0.0f;            // secondes ecoulees a l'ecran
+    };
+    std::deque<Event> events;        // le plus recent en tete
+    float event_lifetime = 4.0f;
+
+    // --- Fragmentation (NASA Standard Breakup Model) ---
+    bool breakup = false;
+    Fragmentation frag;
+    struct Burst {                   // eclair a l'ecran a l'endroit d'une fragmentation
+        BreakupEvent ev;
+        float age = 0.0f;
+    };
+    std::deque<Burst> bursts;        // la plus recente en tete
+    long long total_breakups = 0, total_catastrophic = 0;
+    float impact_mass_kg = 10.0f;
+    float impact_vrel_km_s = 10.0f;
+
+    std::vector<Conjunction> run_detection(double t0) {
+        if (breakup) {
+            // Meme regle que la ligne de commande : en mode fragmentation, le
+            // seuil colle a l'enveloppe de collision (plus grande somme de
+            // rayons), sinon les fragments freres d'un nuage frais noient la
+            // detection de passages sans consequence.
+            double max_size_m = 0;
+            for (const Object& o : sim.objects) max_size_m = std::max(max_size_m, o.size_m);
+            screen_cfg.threshold_km = max_size_m * 1e-3 * screen_cfg.radius_scale;
+        }
+        auto c0 = std::chrono::steady_clock::now();
+        std::vector<Conjunction> found =
+            screen_step(before, sim.objects, t0, sim.dt, screen_cfg, &last_stats);
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - c0).count();
+        detect_ms = detect_ms > 0 ? 0.9 * detect_ms + 0.1 * ms : ms;
+
+        for (const Conjunction& c : found) {
+            Event e;
+            e.i = c.i; e.j = c.j; e.t = c.t;
+            e.miss_km = c.miss_km; e.v_rel = c.v_rel_km_s;
+            e.collision = c.collision;
+            e.ri = sim.objects[c.i].s.r;
+            e.rj = sim.objects[c.j].s.r;
+            events.push_front(e);
+            ++total_conj;
+            if (c.collision) ++total_coll;
+        }
+        while (events.size() > 200) events.pop_back();
+        return found;
+    }
+
+    void record_breakup(const BreakupEvent& ev) {
+        bursts.push_front({ev, 0.0f});
+        while (bursts.size() > 200) bursts.pop_back();
+        ++total_breakups;
+        if (ev.catastrophic) ++total_catastrophic;
+    }
+
+    // Un pas de simulation en mode Live avec detection, et fragmentation si
+    // elle est active.
+    void live_step() {
+        before.resize(sim.objects.size());
+        for (size_t i = 0; i < sim.objects.size(); ++i) before[i] = sim.objects[i].s;
+        double t0 = sim.t;
+        sim.step();
+        std::vector<Conjunction> found = run_detection(t0);
+        if (breakup)
+            for (const BreakupEvent& ev : frag.apply(sim, before, t0, sim.dt, found))
+                record_breakup(ev);
+    }
+
+    void impact_selected() {
+        if (selected < 0 || selected >= static_cast<int>(sim.objects.size())) return;
+        if (!sim.objects[selected].alive) return;
+        // Pour suivre les consequences, la detection et la fragmentation
+        // doivent tourner : on les active.
+        detect = breakup = true;
+        const size_t first_fragment = sim.objects.size();
+        record_breakup(frag.impact(sim, selected, impact_mass_kg, impact_vrel_km_s));
+        // Un objet detruit n'est plus propage : la camera resterait au point
+        // d'impact pendant que le nuage s'en va. On selectionne un fragment
+        // pour que la vue suive le nuage.
+        if (!sim.objects[selected].alive && sim.objects.size() > first_fragment)
+            selected = static_cast<int>(first_fragment);
+        look_from_above(selected);
+    }
+
+    // Place la camera a la verticale de l'objet, cote espace : la Terre est
+    // alors en arriere-plan au lieu de s'interposer.
+    void look_from_above(int idx) {
+        const Vec3& r = sim.objects[idx].s.r;
+        // Meme permutation d'axes que to_render : (x, z, y).
+        double x = r.x, y = r.z, z = r.y, n = norm(r);
+        cam.azimuth = static_cast<float>(std::atan2(z, x));
+        cam.elevation = static_cast<float>(std::clamp(std::asin(y / n), -1.5, 1.5));
+        cam.distance = 4.0f;
+        follow_selected = true;
+    }
 
     void reset() {
-        for (size_t i = 0; i < sim.objects.size(); ++i) {
-            sim.objects[i].s = initial[i];
-            sim.objects[i].alive = true;
-        }
+        sim.objects = catalog;   // retire aussi les fragments
         sim.t = 0.0;
+        frag = Fragmentation(frag.config());   // meme graine : run reproductible
+        events.clear();
+        bursts.clear();
+        total_conj = total_coll = total_breakups = total_catastrophic = 0;
+        if (selected >= static_cast<int>(catalog.size())) selected = -1;
+        tracked.erase(std::remove_if(tracked.begin(), tracked.end(),
+                                     [&](int i) { return i >= static_cast<int>(catalog.size()); }),
+                      tracked.end());
     }
 
     void scan_snapshots() {
@@ -230,6 +375,16 @@ struct App {
         const long n = static_cast<long>(sim.objects.size());
         std::string needle(filters.search);
 
+        // Le nombre d'objets change : fragments ajoutes en Live, snapshot plus
+        // ancien ou plus recent en Relecture.
+        alt.resize(n);
+        inc.resize(n);
+        visible.resize(n);
+        if (selected >= n) selected = -1;
+        tracked.erase(std::remove_if(tracked.begin(), tracked.end(),
+                                     [&](int i) { return i >= n; }),
+                      tracked.end());
+
         #pragma omp parallel for schedule(static)
         for (long i = 0; i < n; ++i) {
             const Object& o = sim.objects[i];
@@ -241,11 +396,13 @@ struct App {
         }
 
         visible_count = 0;
-        for (int t = 0; t < TYPE_COUNT; ++t) type_visible[t] = 0;
+        alive_fragments = 0;
+        for (int t = 0; t < CATEGORY_COUNT; ++t) type_visible[t] = 0;
 
         for (long i = 0; i < n; ++i) {
             const Object& o = sim.objects[i];
-            int ti = static_cast<int>(o.type);
+            int ti = category_of(o);
+            if (o.alive && o.is_fragment()) ++alive_fragments;
             bool ok = o.alive && filters.type_on[ti]
                       && alt[i] >= filters.alt_min && alt[i] <= filters.alt_max
                       && inc[i] >= filters.inc_min && inc[i] <= filters.inc_max;
@@ -377,11 +534,11 @@ void draw_filters_panel(App& app) {
     ImGui::PushItemWidth(150);
     Filters& f = app.filters;
 
-    for (int t = 0; t < TYPE_COUNT; ++t) {
-        Color c = TYPE_COLOR[t];
+    for (int t = 0; t < CATEGORY_COUNT; ++t) {
+        Color c = CATEGORY_COLOR[t];
         ImGui::PushStyleColor(ImGuiCol_Text,
                               IM_COL32(c.r, c.g, c.b, 255));
-        ImGui::Checkbox(object_type_name(static_cast<ObjectType>(t)), &f.type_on[t]);
+        ImGui::Checkbox(category_name(t), &f.type_on[t]);
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextDisabled("(%d)", app.type_visible[t]);
@@ -410,6 +567,200 @@ void draw_filters_panel(App& app) {
     ImGui::End();
 }
 
+// Distance lisible : metres en dessous du kilometre.
+std::string format_distance(double km) {
+    char buf[32];
+    if (km < 1.0) std::snprintf(buf, sizeof(buf), "%.0f m", km * 1000.0);
+    else std::snprintf(buf, sizeof(buf), "%.2f km", km);
+    return buf;
+}
+
+void draw_detection_panel(App& app) {
+    ImGui::SetNextWindowPos({GetScreenWidth() - 380.0f, 10}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({370, 520}, ImGuiCond_FirstUseEver);
+    ImGui::Begin("Rapprochements");
+
+    if (app.replay_mode) {
+        ImGui::TextWrapped("La detection a besoin des etats en debut et en fin de pas : "
+                           "elle n'est disponible qu'en mode Live.");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Checkbox("Detection active", &app.detect);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%.1f ms/pas)", app.detect_ms);
+    if (app.detect && app.steps_per_frame > 3)
+        ImGui::TextColored({1.0f, 0.75f, 0.3f, 1.0f},
+                           "%d pas par image : ~%.0f ms d'analyse par image.",
+                           app.steps_per_frame, app.detect_ms * app.steps_per_frame);
+
+    ImGui::PushItemWidth(140);
+    if (app.breakup) {
+        // Le seuil suit l'enveloppe de collision : voir App::run_detection.
+        ImGui::TextDisabled("Seuil : %.0f m (enveloppe de collision)",
+                            app.screen_cfg.threshold_km * 1000.0);
+    } else {
+        float seuil = static_cast<float>(app.screen_cfg.threshold_km);
+        if (ImGui::SliderFloat("Seuil (km)", &seuil, 0.1f, 50.0f, "%.1f",
+                               ImGuiSliderFlags_Logarithmic))
+            app.screen_cfg.threshold_km = seuil;
+    }
+
+    float scale = static_cast<float>(app.screen_cfg.radius_scale);
+    if (ImGui::SliderFloat("Facteur de rayon", &scale, 1.0f, 10000.0f, "x%.0f",
+                           ImGuiSliderFlags_Logarithmic))
+        app.screen_cfg.radius_scale = scale;
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Multiplie les rayons de collision (0.1 / 0.4 / 2 m selon\n"
+                          "la taille radar). Le taux de collision croit comme le\n"
+                          "carre du facteur : x100 donne ~100 a 130 collisions par\n"
+                          "jour entre objets du catalogue (mesure).");
+
+    ImGui::Checkbox("Debug : grille de detection", &app.show_grid);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Trace les cellules de la grille. Avec un objet selectionne,\n"
+                          "montre sa cellule et les 26 voisines reellement examinees.");
+
+    ImGui::Separator();
+    ImGui::Text("Total : %lld rapprochements, %lld collisions",
+                app.total_conj, app.total_coll);
+    ImGui::Text("Cellule %.0f km, %lld paires candidates/pas",
+                app.last_stats.cell_km, app.last_stats.candidate_pairs);
+    ImGui::TextDisabled("%lld paires volant de concert, ecartees",
+                        app.last_stats.co_orbiting);
+
+    // --- Fragmentation ---
+    ImGui::Separator();
+    ImGui::Checkbox("Fragmentation (SBM)", &app.breakup);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Chaque collision detectee fragmente les objets selon le NASA\n"
+                          "Standard Breakup Model : catastrophique au-dela de 40 J/g,\n"
+                          "fragments groupes autour de l'orbite de leur parent.\n"
+                          "Active aussi la detection.");
+    if (app.breakup) app.detect = true;   // pas de fragmentation sans detection
+
+    ImGui::PushItemWidth(140);
+    float lc = static_cast<float>(app.frag.config().lc_m);
+    if (ImGui::SliderFloat("Plus petit fragment", &lc, 0.01f, 1.0f, "%.2f m",
+                           ImGuiSliderFlags_Logarithmic))
+        app.frag.config().lc_m = lc;
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Seuil de taille L_c des fragments suivis. Le nombre de fragments\n"
+                          "croit comme L_c^-1.71 : 10 cm -> ~1 500 pour une collision\n"
+                          "catastrophique entre deux objets d'une tonne, 1 cm -> ~80 000.");
+
+    ImGui::Text("%lld fragmentations, dont %lld catastrophiques",
+                app.total_breakups, app.total_catastrophic);
+    ImGui::Text("%lld fragments crees, %d en orbite",
+                app.frag.fragments_created(), app.alive_fragments);
+
+    if (!app.bursts.empty() && ImGui::CollapsingHeader("Fragmentations recentes")) {
+        for (size_t k = 0; k < app.bursts.size() && k < 30; ++k) {
+            const BreakupEvent& ev = app.bursts[k].ev;
+            ImGui::TextColored(ev.catastrophic ? ImVec4{1.0f, 0.45f, 0.45f, 1.0f}
+                                               : ImVec4{1.0f, 0.8f, 0.4f, 1.0f},
+                               "%.2f h  %s / %s  -> %d frag.", ev.t / 3600.0,
+                               ev.target_name.c_str(), ev.projectile_name.c_str(), ev.fragments);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\nvitesse relative %.1f km/s, %.0f J/g\n"
+                                  "masses %.1f kg / %.2f kg\n%d fragments (%.0f kg), %d echappes",
+                                  ev.catastrophic ? "CATASTROPHIQUE" : "non catastrophique",
+                                  ev.v_rel_km_s, ev.energy_j_per_g, ev.target_mass_kg,
+                                  ev.projectile_mass_kg, ev.fragments, ev.fragments_mass_kg,
+                                  ev.escaped);
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Effacer")) {
+        app.events.clear();
+        app.total_conj = app.total_coll = 0;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("clic : selectionner et centrer");
+
+    ImGui::BeginChild("liste");
+    for (size_t k = 0; k < app.events.size(); ++k) {
+        const App::Event& e = app.events[k];
+        ImGui::PushID(static_cast<int>(k));
+        if (e.collision) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 90, 90, 255));
+        bool clicked = ImGui::Selectable(
+            (format_distance(e.miss_km) + "  " + app.sim.objects[e.i].name +
+             "  /  " + app.sim.objects[e.j].name).c_str());
+        if (e.collision) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("t = %.3f h\nvitesse relative %.2f km/s\n%s",
+                              e.t / 3600.0, e.v_rel,
+                              e.collision ? "COLLISION" : "passage");
+        if (clicked) {
+            app.selected = e.i;
+            app.follow_selected = true;
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+// Trace la grille de detection : la cellule de l'objet selectionne et ses 26
+// voisines — exactement le voisinage examine — ou, a defaut de selection, les
+// cellules occupees autour du point vise.
+void draw_grid_debug(const App& app) {
+    double cell = app.last_stats.cell_km;
+    if (cell <= 0) return;
+    float side = static_cast<float>(cell * SCALE);
+
+    auto cube = [&](int64_t ix, int64_t iy, int64_t iz, Color col) {
+        Vec3 c{(ix + 0.5) * cell, (iy + 0.5) * cell, (iz + 0.5) * cell};
+        DrawCubeWires(to_render(c), side, side, side, col);
+    };
+    auto cell_of = [&](const Vec3& r) {
+        return std::array<int64_t, 3>{{static_cast<int64_t>(std::floor(r.x / cell)),
+                                       static_cast<int64_t>(std::floor(r.y / cell)),
+                                       static_cast<int64_t>(std::floor(r.z / cell))}};
+    };
+
+    if (app.selected >= 0) {
+        auto c = cell_of(app.sim.objects[app.selected].s.r);
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz)
+                    cube(c[0] + dx, c[1] + dy, c[2] + dz,
+                         (dx || dy || dz) ? Color{70, 130, 180, 90} : Color{120, 230, 160, 220});
+        return;
+    }
+
+    // Sans selection : les cellules occupees les plus proches de la camera,
+    // plafonnees pour ne pas noyer la vue. Centrer sur le point vise ne
+    // montrerait rien, celui-ci etant au centre de la Terre par defaut.
+    Camera3D c3d = app.cam.to_camera3d();
+    Vec3 eye{c3d.position.x / SCALE, c3d.position.z / SCALE, c3d.position.y / SCALE};
+
+    std::unordered_set<uint64_t> seen;
+    std::vector<std::pair<double, std::array<int64_t, 3>>> occupied;
+    for (size_t i = 0; i < app.sim.objects.size(); ++i) {
+        if (!app.visible[i]) continue;
+        auto c = cell_of(app.sim.objects[i].s.r);
+        uint64_t key = (uint64_t(c[0] + 1048576) << 42) | (uint64_t(c[1] + 1048576) << 21)
+                     | uint64_t(c[2] + 1048576);
+        if (!seen.insert(key).second) continue;
+        Vec3 centre{(c[0] + 0.5) * cell, (c[1] + 0.5) * cell, (c[2] + 0.5) * cell};
+        occupied.push_back({norm(centre - eye), c});
+    }
+
+    const size_t cap = 300;
+    if (occupied.size() > cap)
+        std::nth_element(occupied.begin(), occupied.begin() + cap, occupied.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    size_t count = std::min(cap, occupied.size());
+    for (size_t k = 0; k < count; ++k)
+        cube(occupied[k].second[0], occupied[k].second[1], occupied[k].second[2],
+             {70, 130, 180, 80});
+}
+
 void draw_selection_panel(App& app) {
     place_panel(600, 290);
     ImGui::Begin("Selection");
@@ -421,6 +772,10 @@ void draw_selection_panel(App& app) {
         ImGui::Text("NORAD %d  -  %s", o.id, object_type_name(o.type));
         if (!o.country.empty()) ImGui::Text("Pays : %s", o.country.c_str());
         if (!o.rcs.empty()) ImGui::Text("Taille radar : %s", o.rcs.c_str());
+        if (o.mass_kg > 0)
+            ImGui::Text("Masse %.3g kg, taille %.2f m%s", o.mass_kg, o.size_m,
+                        o.is_fragment() ? "" : " (estimees)");
+        if (!o.alive) ImGui::TextColored({1.0f, 0.45f, 0.45f, 1.0f}, "DETRUIT");
         ImGui::Separator();
         ImGui::Text("Altitude    %.1f km", norm(o.s.r) - R_EARTH);
         ImGui::Text("Vitesse     %.3f km/s", norm(o.s.v));
@@ -453,6 +808,23 @@ void draw_selection_panel(App& app) {
         if (ImGui::Button(tracked ? "Ne plus suivre" : "Suivre")) app.toggle_tracked(app.selected);
         ImGui::SameLine();
         ImGui::Checkbox("Camera liee", &app.follow_selected);
+
+        // Collision provoquee : un projectile fictif percute l'objet.
+        if (!app.replay_mode && o.alive) {
+            ImGui::SeparatorText("Provoquer un impact");
+            ImGui::PushItemWidth(140);
+            ImGui::SliderFloat("Masse projectile", &app.impact_mass_kg, 0.01f, 1000.0f,
+                               "%.2f kg", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Vitesse relative", &app.impact_vrel_km_s, 0.5f, 15.0f,
+                               "%.1f km/s");
+            ImGui::PopItemWidth();
+            double e = 500.0 * app.impact_mass_kg * app.impact_vrel_km_s * app.impact_vrel_km_s
+                     / std::max(o.mass_kg, 1e-6);
+            ImGui::TextDisabled("%.0f J/g : %s", e,
+                                e >= app.frag.config().catastrophic_j_per_g
+                                    ? "catastrophique" : "non catastrophique");
+            if (ImGui::Button("Impact")) app.impact_selected();
+        }
     } else {
         ImGui::TextWrapped("Clic droit sur un objet pour le selectionner.");
     }
@@ -501,14 +873,37 @@ int main(int argc, char** argv) {
     std::string screenshot;
     int screenshot_frames = 45;
 
+    bool start_play = false, start_detect = false, start_grid = false, start_breakup = false;
+    double start_scale = 1.0;
+    int threads = 0;   // 0 = defaut d'OpenMP
+    int impact_id = -1;
+    double impact_mass = 10.0, impact_vrel = 10.0;
+    std::string masses_path = "config/masses.csv";
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--screenshot" && i + 1 < argc) screenshot = argv[++i];
         else if (a == "--frames" && i + 1 < argc) screenshot_frames = std::atoi(argv[++i]);
+        else if (a == "--play") start_play = true;
+        else if (a == "--detect") { start_detect = true; start_play = true; }
+        else if (a == "--breakup") { start_breakup = start_detect = start_play = true; }
+        else if (a == "--grid") start_grid = true;
+        else if (a == "--radius-scale" && i + 1 < argc) start_scale = std::atof(argv[++i]);
+        else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+        else if (a == "--masses" && i + 1 < argc) masses_path = argv[++i];
+        else if (a == "--impact" && i + 1 < argc) impact_id = std::atoi(argv[++i]);
+        else if (a == "--impact-mass" && i + 1 < argc) impact_mass = std::atof(argv[++i]);
+        else if (a == "--impact-vrel" && i + 1 < argc) impact_vrel = std::atof(argv[++i]);
         else if (!a.empty() && a[0] != '-') catalog = a;
     }
 
+    int used_threads = configure_threads(threads);
+
     App app;
+    app.playing = start_play;
+    app.detect = start_detect;
+    app.breakup = start_breakup;
+    app.show_grid = start_grid;
+    app.screen_cfg.radius_scale = start_scale;
     app.catalog_path = catalog;
     int dropped = 0;
     app.sim.objects = load_catalog(catalog, &dropped);
@@ -518,12 +913,37 @@ int main(int argc, char** argv) {
         return 1;
     }
     app.sim.epoch_jd = read_epoch_jd(catalog);
-    for (const auto& o : app.sim.objects) app.initial.push_back(o.s);
+
+    MassTable masses;
+    if (std::filesystem::exists(masses_path)) {
+        std::string err;
+        if (!masses.load(masses_path, &err)) {
+            std::printf("Table des masses : %s\n", err.c_str());
+            return 1;
+        }
+    }
+    assign_masses(app.sim.objects, masses);
+    app.catalog = app.sim.objects;
+
+    if (impact_id >= 0) {
+        for (size_t i = 0; i < app.sim.objects.size(); ++i)
+            if (app.sim.objects[i].id == impact_id) app.selected = static_cast<int>(i);
+        if (app.selected < 0) {
+            std::printf("--impact : aucun objet de NORAD %d.\n", impact_id);
+            return 1;
+        }
+        app.impact_mass_kg = static_cast<float>(impact_mass);
+        app.impact_vrel_km_s = static_cast<float>(impact_vrel);
+        app.impact_selected();
+        app.playing = true;
+    }
+
     app.alt.resize(app.sim.objects.size());
     app.inc.resize(app.sim.objects.size());
     app.visible.assign(app.sim.objects.size(), 1);
     app.scan_snapshots();
-    std::printf("%zu objets charges (%d lignes ignorees).\n", app.sim.objects.size(), dropped);
+    std::printf("%zu objets charges (%d lignes ignorees), %d threads.\n",
+                app.sim.objects.size(), dropped, used_threads);
 
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1600, 900, "Kessler_Sim - viewer");
@@ -539,16 +959,16 @@ int main(int argc, char** argv) {
     instanced.locs[SHADER_LOC_COLOR_DIFFUSE] = GetShaderLocation(instanced, "colDiffuse");
     instanced.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocationAttrib(instanced, "instanceTransform");
 
-    Material point_mat[TYPE_COUNT];
-    for (int t = 0; t < TYPE_COUNT; ++t) {
+    Material point_mat[CATEGORY_COUNT];
+    for (int t = 0; t < CATEGORY_COUNT; ++t) {
         point_mat[t] = LoadMaterialDefault();
         point_mat[t].shader = instanced;
-        point_mat[t].maps[MATERIAL_MAP_DIFFUSE].color = TYPE_COLOR[t];
+        point_mat[t].maps[MATERIAL_MAP_DIFFUSE].color = CATEGORY_COLOR[t];
     }
 
     Model earth = LoadModelFromMesh(GenMeshSphere(static_cast<float>(R_EARTH) * SCALE, 24, 48));
 
-    std::vector<Matrix> transforms[TYPE_COUNT];
+    std::vector<Matrix> transforms[CATEGORY_COUNT];
     int frame = 0;
 
     while (!WindowShouldClose()) {
@@ -571,10 +991,18 @@ int main(int argc, char** argv) {
                 if (!app.snapshots.empty())
                     app.load_snapshot_at((app.snapshot_index + 1) %
                                          static_cast<int>(app.snapshots.size()));
+            } else if (app.detect) {
+                // Detection a chaque pas : c'est la condition pour ne rien
+                // rater, le TCA etant cherche a l'interieur du pas.
+                for (int k = 0; k < app.steps_per_frame; ++k) app.live_step();
             } else {
                 app.sim.advance(app.steps_per_frame);
             }
         }
+
+        float dt_frame = GetFrameTime();
+        for (App::Event& e : app.events) e.age += dt_frame;
+        for (App::Burst& b : app.bursts) b.age += dt_frame;
 
         app.refresh_derived();
 
@@ -585,11 +1013,11 @@ int main(int argc, char** argv) {
 
         // --- Matrices d'instances ---
         float pr = app.cam.distance * app.point_scale;
-        for (int t = 0; t < TYPE_COUNT; ++t) transforms[t].clear();
+        for (int t = 0; t < CATEGORY_COUNT; ++t) transforms[t].clear();
         for (size_t i = 0; i < app.sim.objects.size(); ++i) {
             if (!app.visible[i]) continue;
             Vector3 p = to_render(app.sim.objects[i].s.r);
-            transforms[static_cast<int>(app.sim.objects[i].type)].push_back(
+            transforms[category_of(app.sim.objects[i])].push_back(
                 MatrixMultiply(MatrixScale(pr, pr, pr), MatrixTranslate(p.x, p.y, p.z)));
         }
 
@@ -603,10 +1031,22 @@ int main(int argc, char** argv) {
         DrawSphereWires({0, 0, 0}, static_cast<float>(R_EARTH) * SCALE * 1.002f, 12, 24,
                         {60, 110, 170, 110});
 
-        for (int t = 0; t < TYPE_COUNT; ++t)
+        for (int t = 0; t < CATEGORY_COUNT; ++t)
             if (!transforms[t].empty())
                 DrawMeshInstanced(point_mesh, point_mat[t], transforms[t].data(),
                                   static_cast<int>(transforms[t].size()));
+
+        // Fragmentations recentes : une sphere qui s'etend puis s'efface a
+        // l'endroit de l'evenement. Rouge si catastrophique.
+        for (const App::Burst& b : app.bursts) {
+            const float life = 6.0f;
+            if (b.age > life) continue;
+            float f = 1.0f - b.age / life;
+            Color col = b.ev.catastrophic
+                ? Color{255, 60, 60, static_cast<unsigned char>(255 * f)}
+                : Color{255, 190, 80, static_cast<unsigned char>(255 * f)};
+            DrawSphereWires(to_render(b.ev.position), pr * (8.0f + 40.0f * b.age / life), 8, 10, col);
+        }
 
         // Traces des objets suivis + mise en evidence
         for (int i : app.tracked) {
@@ -618,6 +1058,22 @@ int main(int argc, char** argv) {
             Vector3 p = to_render(app.sim.objects[app.selected].s.r);
             DrawSphereWires(p, pr * 4.0f, 6, 8, WHITE);
         }
+
+        // Rapprochements recents : un segment entre les deux objets, qui
+        // s'efface en quelques secondes. Rouge pour une collision.
+        for (const App::Event& e : app.events) {
+            if (e.age > app.event_lifetime) continue;
+            float f = 1.0f - e.age / app.event_lifetime;
+            Color col = e.collision
+                ? Color{255, 70, 70, static_cast<unsigned char>(255 * f)}
+                : Color{255, 235, 130, static_cast<unsigned char>(210 * f)};
+            Vector3 a = to_render(e.ri), b = to_render(e.rj);
+            DrawLine3D(a, b, col);
+            DrawSphereWires({(a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2},
+                            pr * (e.collision ? 6.0f : 3.0f), 5, 6, col);
+        }
+
+        if (app.show_grid) draw_grid_debug(app);
 
         // Lune, a l'echelle et a sa vraie position
         Vector3 moon = to_render(app.sim.moon());
@@ -641,6 +1097,7 @@ int main(int argc, char** argv) {
         draw_simulation_panel(app);
         draw_filters_panel(app);
         draw_selection_panel(app);
+        draw_detection_panel(app);
         rlImGuiEnd();
 
         EndDrawing();

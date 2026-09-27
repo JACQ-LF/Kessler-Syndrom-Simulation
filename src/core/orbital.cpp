@@ -156,6 +156,10 @@ std::vector<Object> load_catalog(const std::string& path, int* dropped) {
             o.type = parse_object_type(f[2]);
             o.country = f[4];
             o.rcs = f[5];
+            // Dimension caracteristique tiree de la categorie de section radar
+            // (SMALL < 0.1 m2, MEDIUM 0.1 - 1 m2, LARGE > 1 m2). Le rayon de
+            // collision en est la moitie : 0.1 / 0.4 / 2 m.
+            o.size_m = o.rcs == "SMALL" ? 0.2 : o.rcs == "LARGE" ? 4.0 : 0.8;
             o.s.r = {std::stod(f[11]), std::stod(f[12]), std::stod(f[13])};
             o.s.v = {std::stod(f[14]), std::stod(f[15]), std::stod(f[16])};
             objs.push_back(std::move(o));
@@ -206,7 +210,6 @@ bool read_snapshot(const std::string& path, std::vector<Object>& objs, double* t
             continue;
         }
         if (!header_done) { header_done = true; continue; }  // ligne d'en-tete des colonnes
-        if (i >= objs.size()) return false;                  // snapshot plus long que le catalogue
 
         std::stringstream ss(line);
         std::string tok;
@@ -214,14 +217,35 @@ bool read_snapshot(const std::string& path, std::vector<Object>& objs, double* t
         while (std::getline(ss, tok, ',')) f.push_back(tok);
         if (f.size() < 8) return false;
         try {
-            if (std::stoi(f[0]) != objs[i].id) return false;  // ordre different du catalogue
+            int id = std::stoi(f[0]);
+            if (i >= objs.size()) {
+                // Fragment cree en cours de run : le snapshot ne garde que son
+                // etat, on lui donne des proprietes generiques.
+                if (id < FRAGMENT_ID_BASE) return false;
+                Object o;
+                o.id = id;
+                o.name = "FRAG " + std::to_string(id - FRAGMENT_ID_BASE);
+                o.type = ObjectType::Debris;
+                o.rcs = "SMALL";
+                o.size_m = 0.1;
+                o.event = 0;
+                objs.push_back(std::move(o));
+            } else if (id != objs[i].id) {
+                return false;  // ordre different du catalogue
+            }
             objs[i].s.r = {std::stod(f[1]), std::stod(f[2]), std::stod(f[3])};
             objs[i].s.v = {std::stod(f[4]), std::stod(f[5]), std::stod(f[6])};
             objs[i].alive = std::stoi(f[7]) != 0;
         } catch (...) { return false; }
         ++i;
     }
-    return i == objs.size();
+    // Snapshot plus ancien, avec moins de fragments : on retire l'excedent.
+    if (i < objs.size()) {
+        for (size_t k = i; k < objs.size(); ++k)
+            if (!objs[k].is_fragment()) return false;  // un objet du catalogue manque
+        objs.resize(i);
+    }
+    return true;
 }
 
 std::string jd_to_utc_string(double jd) {
@@ -273,6 +297,14 @@ void Simulation::step() {
         if (norm(o.s.r) < R_EARTH) o.alive = false;   // rentree / impact
     }
     t += dt;
+}
+
+State Simulation::propagate_state(const State& s, double t_from, double duration) const {
+    if (duration <= 0) return s;
+    double jd0 = epoch_jd + t_from / 86400.0;
+    return rk4(s, duration, moon_position(jd0),
+               moon_position(jd0 + duration / 2 / 86400.0),
+               moon_position(jd0 + duration / 86400.0));
 }
 
 }  // namespace kessler
