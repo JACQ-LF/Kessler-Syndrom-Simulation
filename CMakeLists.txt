@@ -26,6 +26,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}")
 add_library(kessler_core STATIC
     src/core/orbital.cpp
     src/core/collision.cpp
+    src/core/breakup.cpp
     src/core/threads.cpp)
 target_include_directories(kessler_core PUBLIC src)
 

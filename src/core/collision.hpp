@@ -46,9 +46,13 @@ struct ScreeningStats {
     double pairs_s = 0.0;           // temps de parcours des paires
 };
 
-// Rayon de collision equivalent, en km, tire de la categorie de section
-// radar du catalogue — la seule information de taille disponible.
+// Rayon de collision equivalent, en km : la moitie de la dimension
+// caracteristique de l'objet (Object::size_m).
 double collision_radius_km(const Object& o, double scale = 1.0);
+
+// Etat d'un objet a la fraction s (0..1) d'un pas de duree dt, interpole par
+// Hermite entre ses etats de debut (a) et de fin (b) de pas.
+State interpolate_state(const State& a, const State& b, double dt, double s);
 
 // Rapprochements survenus pendant le pas [t0, t0 + dt], connaissant les etats
 // en debut de pas (`before`) et en fin de pas (`after`, apres Simulation::step).

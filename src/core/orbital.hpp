@@ -60,12 +60,27 @@ enum class ObjectType { Payload = 0, Debris, RocketBody, Unknown, Count };
 ObjectType parse_object_type(const std::string& s);
 const char* object_type_name(ObjectType t);
 
+// Identifiants attribues aux fragments crees par la simulation, bien au-dela
+// des numeros NORAD pour ne jamais les confondre.
+inline constexpr int FRAGMENT_ID_BASE = 10000000;
+
 struct Object {
     int id = 0;
     std::string name, country, rcs;
     ObjectType type = ObjectType::Unknown;
     State s;
-    bool alive = true;   // false une fois passe sous la surface terrestre
+    bool alive = true;   // false une fois detruit ou passe sous la surface terrestre
+
+    // Proprietes physiques. Le catalogue ne donne ni masse ni taille : pour
+    // ses objets, la taille vient de la categorie de section radar et la masse
+    // d'une table reglable (voir breakup.hpp). Les fragments ont les leurs,
+    // tirees par le modele de fragmentation.
+    double size_m = 0.8;          // dimension caracteristique L (m)
+    double mass_kg = 0.0;         // 0 = non renseignee
+    double area_to_mass = 0.0;    // A/m (m2/kg), utile a la future trainee
+    int event = -1;               // fragmentation d'origine, -1 pour le catalogue
+
+    bool is_fragment() const { return event >= 0; }
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +126,9 @@ void write_snapshot(const std::string& path, const std::vector<Object>& objs, do
 
 // Relit un snapshot dans `objs` (meme ordre que l'ecriture). Renvoie false si
 // le fichier est illisible ou ne correspond pas au catalogue charge.
+// Les lignes au-dela du catalogue sont des fragments crees en cours de run :
+// ils sont ajoutes (ou retires si le snapshot en compte moins), avec des
+// proprietes generiques puisque le snapshot ne stocke que leur etat.
 // `t`, s'il est fourni, recoit l'instant du snapshot en secondes.
 bool read_snapshot(const std::string& path, std::vector<Object>& objs, double* t = nullptr);
 
@@ -134,6 +152,11 @@ struct Simulation {
 
     // Avance de `n` pas.
     void advance(long n) { for (long i = 0; i < n; ++i) step(); }
+
+    // Propage un etat isole sur `duration` secondes a partir de l'instant
+    // `t_from` (secondes depuis l'epoch), en un pas de RK4. Sert a amener un
+    // fragment cree en cours de pas jusqu'a la fin du pas.
+    State propagate_state(const State& s, double t_from, double duration) const;
 
     double jd() const { return epoch_jd + t / 86400.0; }
     Vec3 moon() const { return moon_position(jd()); }

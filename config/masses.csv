@@ -1,0 +1,30 @@
+# Masse typique (kg) des objets du catalogue, par categorie de section radar
+# et par type d'objet. Space-Track ne publie pas les masses : ce sont des
+# estimations, a regler. Le fichier est relu a chaque lancement.
+#
+# rcs  : SMALL (< 0.1 m2), MEDIUM (0.1 - 1 m2), LARGE (> 1 m2), NONE (non renseignee)
+# type : PAYLOAD, DEBRIS, ROCKET BODY, UNKNOWN
+#
+# Repartition du catalogue du 2026-08-01, pour savoir quelles cases comptent :
+#                PAYLOAD   DEBRIS   ROCKET BODY   UNKNOWN
+#   SMALL              4     2995             0         8
+#   MEDIUM          1949     6736           235       333
+#   LARGE          13578      349          1900       123   (dont 8838 Starlink)
+#   NONE              33       82            15         0
+rcs,type,mass_kg
+SMALL,PAYLOAD,5
+SMALL,DEBRIS,0.5
+SMALL,ROCKET BODY,50
+SMALL,UNKNOWN,1
+MEDIUM,PAYLOAD,50
+MEDIUM,DEBRIS,5
+MEDIUM,ROCKET BODY,300
+MEDIUM,UNKNOWN,10
+LARGE,PAYLOAD,500
+LARGE,DEBRIS,50
+LARGE,ROCKET BODY,2000
+LARGE,UNKNOWN,100
+NONE,PAYLOAD,100
+NONE,DEBRIS,5
+NONE,ROCKET BODY,500
+NONE,UNKNOWN,10

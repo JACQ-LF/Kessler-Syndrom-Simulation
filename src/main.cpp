@@ -21,10 +21,21 @@
 //   --radius-scale S     multiplie les rayons de collision (defaut 1)
 //   --min-vrel V         vitesse relative minimale d'une rencontre, en m/s (defaut 10) ;
 //                        en dessous, la paire vole de concert et n'est pas une rencontre
-//   --threads N          nombre de threads (defaut : coeurs physiques ; l'hyper-threading
-//                        ralentit ces boucles)
+//   --threads N          nombre de threads (defaut : tous les threads logiques)
 //
-// Les fichiers produits vont dans output/.
+// Fragmentation (NASA Standard Breakup Model, voir src/core/breakup.hpp) :
+//   --breakup            les collisions detectees fragmentent les objets (implique --screen)
+//   --lc L               plus petit fragment suivi, en m (defaut 0.1)
+//   --masses FICHIER     table des masses du catalogue (defaut config/masses.csv)
+//   --seed N             graine du tirage des fragments (defaut 1)
+//   --impact NORAD       provoque l'impact d'un projectile fictif sur cet objet (implique --breakup)
+//   --impact-mass KG     masse du projectile (defaut 10)
+//   --impact-vrel KMS    vitesse relative de l'impact (defaut 10)
+//   --impact-at H        instant de l'impact, en heures (defaut 0)
+//
+// Les fichiers produits vont dans output/ : final_state.csv, snapshots,
+// conjunctions.csv, breakups.csv (une ligne par fragmentation) et
+// population.csv (population d'objets heure par heure, pour suivre une cascade).
 
 #include <algorithm>
 #include <chrono>
@@ -38,6 +49,7 @@
 #include <string>
 #include <vector>
 
+#include "core/breakup.hpp"
 #include "core/collision.hpp"
 #include "core/orbital.hpp"
 #include "core/threads.hpp"
@@ -58,16 +70,37 @@ std::string csv_quote(const std::string& s) {
 
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
-    bool screen = false;
-    int threads = 0;   // 0 = defaut (coeurs physiques)
+    bool screen = false, breakup = false, conj_explicit = false;
+    int threads = 0;   // 0 = defaut d'OpenMP
     ScreeningConfig scfg;
+    BreakupConfig bcfg;
+    std::string masses_path = "config/masses.csv";
+    int impact_id = -1;
+    double impact_mass = 10.0, impact_vrel = 10.0, impact_at_h = 0.0;
     for (int k = 1; k < argc; ++k) {
         std::string a = argv[k];
         if (a == "--screen") {
             screen = true;
+        } else if (a == "--breakup") {
+            breakup = screen = true;
+        } else if (a == "--lc" && k + 1 < argc) {
+            bcfg.lc_m = std::atof(argv[++k]);
+        } else if (a == "--masses" && k + 1 < argc) {
+            masses_path = argv[++k];
+        } else if (a == "--seed" && k + 1 < argc) {
+            bcfg.seed = std::strtoull(argv[++k], nullptr, 10);
+        } else if (a == "--impact" && k + 1 < argc) {
+            impact_id = std::atoi(argv[++k]);
+            breakup = screen = true;
+        } else if (a == "--impact-mass" && k + 1 < argc) {
+            impact_mass = std::atof(argv[++k]);
+        } else if (a == "--impact-vrel" && k + 1 < argc) {
+            impact_vrel = std::atof(argv[++k]);
+        } else if (a == "--impact-at" && k + 1 < argc) {
+            impact_at_h = std::atof(argv[++k]);
         } else if (a == "--conj-km" && k + 1 < argc) {
             scfg.threshold_km = std::atof(argv[++k]);
-            screen = true;
+            screen = conj_explicit = true;
         } else if (a == "--radius-scale" && k + 1 < argc) {
             scfg.radius_scale = std::atof(argv[++k]);
         } else if (a == "--threads" && k + 1 < argc) {
@@ -110,6 +143,31 @@ int main(int argc, char** argv) {
     }
     if (dropped)
         std::cerr << "Attention : " << dropped << " lignes ignorees (format inattendu).\n";
+
+    // Masses du catalogue : fichier de configuration s'il est la, sinon les
+    // valeurs par defaut (identiques a celles du fichier livre).
+    MassTable masses;
+    {
+        std::string err;
+        if (!std::filesystem::exists(masses_path)) {
+            if (breakup) std::cout << masses_path << " absent : masses par defaut.\n";
+        } else if (!masses.load(masses_path, &err)) {
+            std::cerr << "Table des masses : " << err << "\n";
+            return 1;
+        }
+    }
+    assign_masses(sim.objects, masses);
+    const size_t catalog_count = sim.objects.size();
+
+    int impact_index = -1;
+    if (impact_id >= 0) {
+        for (size_t i = 0; i < sim.objects.size(); ++i)
+            if (sim.objects[i].id == impact_id) impact_index = static_cast<int>(i);
+        if (impact_index < 0) {
+            std::cerr << "--impact : aucun objet de NORAD " << impact_id << " dans le catalogue.\n";
+            return 1;
+        }
+    }
 
     std::cout << sim.objects.size() << " objets charges. Duree " << duration / 3600.0
               << " h, pas " << dt << " s\n"
@@ -174,16 +232,95 @@ int main(int argc, char** argv) {
     long long below[4] = {0, 0, 0, 0};           // < 0.1, < 1, < 2, < 5 km
     const double bins[4] = {0.1, 1.0, 2.0, 5.0};
     double t_prop = 0, t_screen = 0, t_grid = 0, t_pairs = 0;
+    if (breakup && !conj_explicit) {
+        // En mode fragmentation, seules les collisions importent : le seuil
+        // se cale sur la plus grande somme de rayons possible. Un seuil plus
+        // large ferait affiner des paires pour rien — leur nombre croit comme
+        // le carre du seuil — et, dans les nuages de fragments frais, des
+        // centaines de milliers de passages entre fragments freres.
+        double max_size_m = 0;
+        for (const Object& o : sim.objects) max_size_m = std::max(max_size_m, o.size_m);
+        scfg.threshold_km = max_size_m * 1e-3 * scfg.radius_scale;
+    }
     if (screen) {
         conj_out.open(OUT_DIR + "/conjunctions.csv");
         conj_out << "t_s,id1,id2,name1,name2,miss_km,v_rel_km_s,collision\n";
         conj_out << std::setprecision(10);
-        std::cout << "Detection : seuil " << scfg.threshold_km << " km, rayons x"
-                  << scfg.radius_scale << "\n";
+        std::cout << "Detection : seuil " << scfg.threshold_km * 1000.0 << " m"
+                  << (breakup && !conj_explicit ? " (enveloppe de collision)" : "")
+                  << ", rayons x" << scfg.radius_scale << "\n";
     }
+
+    // --- Fragmentation ---
+    Fragmentation frag(bcfg);
+    std::ofstream breakup_out, pop_out;
+    long long n_catastrophic = 0, n_breakups = 0, n_escaped = 0;
+    if (breakup) {
+        breakup_out.open(OUT_DIR + "/breakups.csv");
+        breakup_out << "t_s,event,target_id,target_name,projectile_id,projectile_name,"
+                       "catastrophic,v_rel_km_s,energy_j_per_g,target_mass_kg,"
+                       "projectile_mass_kg,sbm_mass_kg,expected_fragments,fragments,"
+                       "fragments_mass_kg,escaped\n";
+        breakup_out << std::setprecision(8);
+        pop_out.open(OUT_DIR + "/population.csv");
+        pop_out << "t_s,t_days,alive,alive_catalog,alive_fragments,breakups,catastrophic,"
+                   "fragments_created\n";
+        std::cout << "Fragmentation (SBM) : L_c = " << bcfg.lc_m << " m, graine "
+                  << bcfg.seed << "\n";
+    }
+
+    auto log_breakup = [&](const BreakupEvent& ev) {
+        ++n_breakups;
+        if (ev.catastrophic) ++n_catastrophic;
+        auto id_of = [&](int idx) { return idx >= 0 ? std::to_string(sim.objects[idx].id) : std::string(); };
+        breakup_out << ev.t << ',' << ev.id << ',' << id_of(ev.target) << ','
+                    << csv_quote(ev.target_name) << ',' << id_of(ev.projectile) << ','
+                    << csv_quote(ev.projectile_name) << ',' << ev.catastrophic << ','
+                    << ev.v_rel_km_s << ',' << ev.energy_j_per_g << ',' << ev.target_mass_kg << ','
+                    << ev.projectile_mass_kg << ',' << ev.sbm_mass_kg << ','
+                    << ev.expected_fragments << ',' << ev.fragments << ','
+                    << ev.fragments_mass_kg << ',' << ev.escaped << '\n';
+        breakup_out.flush();   // un run long doit pouvoir se suivre en cours de route
+        n_escaped += ev.escaped;
+
+        // En cascade, des milliers d'evenements : la console n'en montre que
+        // les premiers, le detail est dans breakups.csv.
+        const long long MAX_PRINTED = 20;
+        if (n_breakups > MAX_PRINTED) {
+            if (n_breakups == MAX_PRINTED + 1)
+                std::cout << "  ... (suite dans " << OUT_DIR << "/breakups.csv)\n";
+            return;
+        }
+        // Flux local : ne pas laisser std::cout en format fixe pour la suite.
+        std::ostringstream msg;
+        msg << std::fixed << "  t = " << std::setprecision(2) << ev.t / 3600.0 << " h : "
+            << ev.target_name << " / " << ev.projectile_name << ", "
+            << std::setprecision(1) << ev.v_rel_km_s << " km/s, "
+            << std::setprecision(0) << ev.energy_j_per_g << " J/g -> "
+            << (ev.catastrophic ? "catastrophique" : "non catastrophique") << ", "
+            << ev.fragments << " fragments\n";
+        std::cout << msg.str();
+    };
+
+    long last_logged_hour = -1;
+    auto log_population = [&]() {
+        long alive = 0, alive_frag = 0;
+        for (const Object& o : sim.objects)
+            if (o.alive) { ++alive; if (o.is_fragment()) ++alive_frag; }
+        pop_out << sim.t << ',' << sim.t / 86400.0 << ',' << alive << ',' << alive - alive_frag
+                << ',' << alive_frag << ',' << n_breakups << ',' << n_catastrophic << ','
+                << frag.fragments_created() << std::endl;   // vide le tampon : suivi en direct
+    };
+    if (breakup) { log_population(); last_logged_hour = 0; }
+
+    bool impact_done = impact_index < 0;
 
     using clock = std::chrono::steady_clock;
     for (long n = 0; n < steps; ++n) {
+        if (!impact_done && sim.t >= impact_at_h * 3600.0) {
+            impact_done = true;
+            log_breakup(frag.impact(sim, impact_index, impact_mass, impact_vrel));
+        }
         if (screen) {
             before.resize(sim.objects.size());
             for (size_t i = 0; i < sim.objects.size(); ++i) before[i] = sim.objects[i].s;
@@ -218,6 +355,14 @@ int main(int argc, char** argv) {
                     closest = c.miss_km; closest_i = c.i; closest_j = c.j; t_closest = c.t;
                 }
             }
+            if (breakup)
+                for (const BreakupEvent& ev : frag.apply(sim, before, t0, sim.dt, found))
+                    log_breakup(ev);
+        }
+
+        if (breakup && static_cast<long>(sim.t / 3600.0) > last_logged_hour) {
+            last_logged_hour = static_cast<long>(sim.t / 3600.0);
+            log_population();
         }
 
         if (next_out > 0 && (n + 1) % next_out == 0) {
@@ -231,14 +376,20 @@ int main(int argc, char** argv) {
 
     write_snapshot(OUT_DIR + "/final_state.csv", sim.objects, sim.t);
 
-    long lost = 0;
+    // Bilan sur les objets du catalogue (les fragments n'ont pas d'etat initial).
+    long lost = 0, destroyed = 0;
     double max_da = 0;
     int max_id = 0;
-    for (size_t i = 0; i < sim.objects.size(); ++i) {
-        if (!sim.objects[i].alive) { ++lost; continue; }
-        double da = std::fabs(elements(sim.objects[i].s).a - elements(initial[i]).a);
-        if (da > max_da) { max_da = da; max_id = sim.objects[i].id; }
+    for (size_t i = 0; i < catalog_count; ++i) {
+        const Object& o = sim.objects[i];
+        if (!o.alive) {
+            if (norm(o.s.r) < R_EARTH) ++lost; else ++destroyed;
+            continue;
+        }
+        double da = std::fabs(elements(o.s).a - elements(initial[i]).a);
+        if (da > max_da) { max_da = da; max_id = o.id; }
     }
+    if (breakup) std::cout << "Objets du catalogue detruits par collision : " << destroyed << "\n";
     std::cout << "Objets sous la surface terrestre : " << lost << "\n"
               << "Plus forte variation de demi-grand axe : " << max_da << " km (NORAD "
               << max_id << ")\n"
@@ -265,6 +416,20 @@ int main(int argc, char** argv) {
                   << "Temps : propagation " << t_prop << " s, detection " << t_screen
                   << " s (grille " << t_grid << " s, paires " << t_pairs << " s)\n"
                   << "Detail dans " << OUT_DIR << "/conjunctions.csv\n";
+    }
+
+    if (breakup) {
+        long alive_frag = 0;
+        for (size_t i = catalog_count; i < sim.objects.size(); ++i)
+            if (sim.objects[i].alive) ++alive_frag;
+        std::cout << "\n--- Fragmentation ---\n"
+                  << "Evenements : " << n_breakups << " dont " << n_catastrophic
+                  << " catastrophiques\n"
+                  << "Fragments crees : " << frag.fragments_created() << ", encore en orbite : "
+                  << alive_frag << "\n"
+                  << "Fragments echappes (trajectoire hyperbolique, ecartes) : " << n_escaped << "\n"
+                  << "Detail dans " << OUT_DIR << "/breakups.csv et " << OUT_DIR
+                  << "/population.csv\n";
     }
     return 0;
 }

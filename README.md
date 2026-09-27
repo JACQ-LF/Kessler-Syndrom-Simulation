@@ -17,9 +17,9 @@ de collisions, fragmentation, cascade.
 | Viewer 3D temps réel, filtres et suivi d'objets | fait |
 | Tracés matplotlib (trajectoires, instantanés) | fait |
 | Détection des rapprochements et collisions (déterministe) | fait |
+| Fragmentation (NASA Standard Breakup Model), impacts provoqués | fait |
+| Traînée atmosphérique | à faire — indispensable pour un seuil de Kessler |
 | Collisions probabilistes (méthode CUBE), pour les runs longs | à faire |
-| Modèle de fragmentation | à faire |
-| Traînée atmosphérique | à faire |
 
 ## Structure
 
@@ -28,6 +28,8 @@ de collisions, fragmentation, cascade.
 ├── src/
 │   ├── core/orbital.*      dynamique partagée : RK4, J2, Lune, entrées/sorties
 │   ├── core/collision.*    détection des rapprochements : grille + instant de rapprochement
+│   ├── core/breakup.*      fragmentation (NASA Standard Breakup Model), masses
+│   ├── core/threads.*      choix du nombre de threads
 │   ├── main.cpp            simulation en ligne de commande
 │   └── viewer/viewer.cpp   viewer 3D temps réel (raylib + Dear ImGui)
 ├── scripts/
@@ -36,6 +38,7 @@ de collisions, fragmentation, cascade.
 │   ├── plot_snapshot.py       trace un instantané du catalogue (nuage de points)
 │   ├── plot_common.py         briques partagées par les deux scripts de tracé
 │   └── check_duplicates.py    vérifie l'absence de doublons dans un export
+├── config/masses.csv       masses estimées du catalogue, par taille radar et type
 ├── data/                   états initiaux (versionnés)
 ├── output/                 sorties de simulation (ignorées par git)
 └── CMakeLists.txt
@@ -165,8 +168,14 @@ ordre de grandeur direct du taux de collision :
 
 > taux ≈ 1 500 × (R₁ + R₂)² par jour, avec R en km
 
-Avec des rayons cumulés d'un mètre, environ 0,5 collision par an. Multiplier
-les rayons par *S* (`--radius-scale`) multiplie ce taux par *S²*.
+Multiplier les rayons par *S* (`--radius-scale`) multiplie ce taux par *S²*.
+Attention à la somme des rayons à retenir : le catalogue est dominé par des
+objets LARGE (rayon 2 m), elle vaut donc plutôt 2 à 4 m qu'un mètre. Mesuré à
+×100 : **100 à 130 collisions par jour** entre objets du catalogue, soit ~4 à 5
+par an aux rayons réels. C'est plus que la réalité, où les collisions
+accidentelles entre objets catalogués se comptent sur une décennie : les
+rayons LARGE sont généreux, et les satellites manœuvrables — Starlink en tête —
+évitent activement les rapprochements, ce que la simulation ignore.
 
 **Limite importante.** Les états initiaux viennent de TLE propagés par SGP4,
 dont l'erreur de position est de l'ordre du kilomètre. Chaque rapprochement
@@ -207,6 +216,135 @@ quand la distance exacte compte.
 À dt = 30 s : environ 14 s par jour simulé, soit ~1 h 25 par année simulée.
 Attention, le coût du parcours croît en N², pas en N : une cascade qui
 multiplierait le nombre d'objets par 4 multiplierait ce terme par 16.
+
+## Fragmentation
+
+```bash
+./kessler_sim data/satellites_20260801_1000Z.txt 24 10 --impact 49157 --impact-mass 10
+./kessler_sim data/satellites_20260801_1000Z.txt 48 30 --breakup --radius-scale 100
+```
+
+La première commande provoque l'impact d'un projectile fictif de 10 kg sur
+STARLINK-3051 à 10 km/s, puis suit le nuage. La seconde laisse les collisions
+survenir d'elles-mêmes, avec une section efficace gonflée pour déclencher une
+cascade en quelques heures au lieu de siècles.
+
+| Option | Défaut | Rôle |
+|---|---|---|
+| `--breakup` | — | les collisions détectées fragmentent les objets |
+| `--impact NORAD` | — | impact d'un projectile fictif sur cet objet (active `--breakup`) |
+| `--impact-mass KG` | 10 | masse du projectile |
+| `--impact-vrel KMS` | 10 | vitesse relative de l'impact |
+| `--impact-at H` | 0 | instant de l'impact, en heures |
+| `--lc L` | 0,1 | plus petit fragment suivi, en mètres |
+| `--masses FICHIER` | `config/masses.csv` | masses estimées du catalogue |
+| `--seed N` | 1 | graine du tirage : un run est reproductible |
+
+Sorties : `output/breakups.csv` (une ligne par fragmentation : parents,
+énergie, fragments) et `output/population.csv` (population heure par heure :
+objets du catalogue, fragments, fragmentations cumulées) — de quoi tracer la
+vitesse d'une cascade.
+
+### Le modèle
+
+C'est le *NASA Standard Breakup Model* (Johnson et al., 2001), référence des
+modèles d'évolution des débris.
+
+1. **Catastrophique ou non.** L'énergie cinétique du projectile rapportée à la
+   masse de la cible, E = ½ m_p v² / m_t, est comparée à **40 J/g**. Au-dessus,
+   les deux objets sont pulvérisés ; en dessous, le projectile est détruit et la
+   cible écornée. À 10 km/s, un projectile de 0,08 % de la masse de la cible
+   suffit : un débris de 800 g détruit un satellite d'une tonne.
+2. **Combien de fragments.** N(> L) = 0,1 · M^0,75 · L^−1,71, avec M la masse
+   mise en jeu. Seuls les fragments au-dessus de `--lc` sont suivis : pour une
+   collision catastrophique entre deux objets d'une tonne, ~1 500 au-dessus de
+   10 cm, ~80 000 au-dessus de 1 cm.
+3. **Quels fragments.** Taille tirée dans cette loi de puissance ; rapport
+   surface/masse tiré dans la distribution du SBM ; masse déduite des deux.
+   Les fragments sont acceptés tant que la masse de leur parent le permet.
+4. **À quelle vitesse.** Celle de *leur* parent plus un Δv isotrope de norme
+   log-normale, de l'ordre de 100 m/s. Les fragments restent donc groupés
+   autour de l'orbite de leur parent : deux nuages distincts, comme observé
+   après la collision Iridium 33 / Cosmos 2251 en 2009.
+
+Pourquoi pas un cône autour de la direction moyenne des deux objets : pour un
+croisement typique à 100°, la vitesse moyenne ne vaut que ~4,8 km/s, et tous les
+fragments retomberaient en moins d'une orbite. Ce modèle ferait disparaître la
+cascade qu'on cherche à étudier.
+
+**Masses.** Space-Track ne publie pas de masses : `config/masses.csv` en donne
+une estimation par catégorie de taille radar et par type d'objet, à régler. Le
+fichier indique la répartition du catalogue entre les cases, pour savoir
+lesquelles comptent — les grosses charges utiles (13 578, dont 8 838 Starlink)
+et les débris moyens (6 736) dominent.
+
+### Vérifications
+
+Sur un cas type Iridium 33 / Cosmos 2251 (950 kg + 560 kg à 11,7 km/s) :
+
+| Grandeur | Résultat | Attendu |
+|---|---|---|
+| Énergie spécifique | 40 347 J/g, catastrophique | idem (calcul direct) |
+| Fragments > 10 cm | 1 128 | 1 242 par la loi ; > 2 000 catalogués en réalité |
+| N(>20 cm)/N(>10 cm) | 0,298 | 2^−1,71 = 0,306 |
+| Δv médian | 105 m/s | ~100 m/s |
+| Isotropie (moyenne des directions, 13 382 fragments) | 0,0071 | ~0,008 (bruit statistique) |
+
+Le SBM sous-estime ce cas précis d'environ un facteur 2 : l'ordre de grandeur
+est bon. Même graine, mêmes fragments : un run est exactement reproductible.
+
+**La cascade entière est indépendante du pas.** Sur 6 h à rayons ×100, les
+mêmes 51 fragmentations — mêmes paires, à la même seconde — à dt = 10 s et à
+dt = 30 s.
+
+### Une cascade, heure par heure
+
+`--breakup --radius-scale 100`, dt = 30 s, sans impact provoqué — les
+collisions surviennent d'elles-mêmes (run arrêté à 28 h) :
+
+| Tranche | Fragmentations | Cumul | Fragments créés (cumul) |
+|---|---|---|---|
+| 0–4 h | 22 | 22 | 10 879 |
+| 4–8 h | 59 | 81 | ~30 000 |
+| 8–12 h | 97 | 178 | 57 865 |
+| 12–16 h | 144 | 322 | 92 151 |
+| 16–20 h | 187 | 509 | 125 699 |
+| 20–24 h | 312 | 821 | 175 464 |
+| 24–28 h | 325 | 1 146 | 237 253 |
+
+Le rythme s'accélère, et la nature des collisions change : au début les
+objets du catalogue se percutent entre eux ; à 28 h, 761 fragmentations
+opposent un objet du catalogue à un fragment et 232 deux fragments, contre 153
+entre objets du catalogue. **Les débris deviennent les projectiles** : c'est le
+mécanisme de Kessler.
+
+Le coût suit : la population passe de 28 000 à plus de 260 000 objets, et le
+parcours des paires croît en N². Les premières heures se simulent en quelques
+secondes ; au-delà de 24 h, chaque heure simulée prend plusieurs minutes.
+
+### Deux réglages de performance
+
+- **Seuil de détection.** En mode fragmentation, sauf `--conj-km` explicite,
+  le seuil se cale sur la plus grande somme de rayons possible. Un seuil de
+  5 km faisait affiner des centaines de milliers de passages entre fragments
+  frères d'un même nuage, sans aucune conséquence.
+- **Fragments échappés.** Un fragment qui reçoit assez de Δv pour une
+  trajectoire hyperbolique quitte l'attraction terrestre : il est écarté à la
+  création et compté à part. La grille dimensionne ses cellules sur l'objet le
+  plus rapide ; 13 fragments à plus de 15 km/s suffisaient à en doubler la
+  taille, et à multiplier par 8 les paires candidates.
+
+### Limites
+
+- **Sans traînée, pas de seuil de Kessler.** Le taux de collision croît comme
+  N² et rien ne retire d'objets : toute situation finit en cascade, il suffit
+  d'attendre. Le seuil est un équilibre entre création de débris et retombées
+  dans l'atmosphère — la traînée est la prochaine brique.
+- La quantité de mouvement n'est conservée qu'en moyenne (Δv isotropes),
+  limite connue du SBM.
+- Les coefficients de surface/masse sont ceux des fragments de satellite ; le
+  SBM en a d'autres pour les étages de fusée, non distingués ici.
+- Les masses du catalogue sont des estimations par catégorie.
 
 ## Viewer 3D
 
@@ -263,9 +401,28 @@ cellules. Avec un objet sélectionné, elle montre sa cellule et les 26 voisines
 c'est-à-dire exactement le voisinage examiné ; sans sélection, les cellules
 occupées les plus proches de la caméra.
 
+**Fragmentation.** La case *Fragmentation (SBM)* du panneau *Rapprochements*
+fait fragmenter chaque collision détectée ; les fragments forment une
+catégorie à part, en magenta, filtrable comme les autres. Chaque événement
+s'affiche comme une sphère qui s'étend puis s'efface, rouge s'il est
+catastrophique, et la liste des fragmentations récentes en donne le détail.
+
+**Provoquer un impact.** Dans *Sélection*, choisis une masse de projectile et
+une vitesse relative : le panneau indique l'énergie et si l'impact sera
+catastrophique. Le bouton *Impact* frappe l'objet sélectionné, active détection
+et fragmentation, puis place la caméra au-dessus du nuage et la fait suivre un
+fragment — la cible détruite, elle, n'est plus propagée. *Retour à l'epoch*
+retire tous les fragments.
+
+```bash
+./kessler_viewer --impact 49157 --impact-mass 10
+```
+
 **État de départ**, pratique pour scripter : `--play` lance la propagation,
-`--detect` active aussi la détection, `--grid` affiche la grille, et
-`--radius-scale S` multiplie les rayons de collision.
+`--detect` active aussi la détection, `--breakup` la fragmentation, `--grid`
+affiche la grille, `--radius-scale S` multiplie les rayons de collision, et
+`--impact NORAD` (avec `--impact-mass`, `--impact-vrel`) frappe un objet au
+démarrage.
 
 Le viewer écrit un `imgui.ini` à la racine pour mémoriser la disposition des
 panneaux. Il est dans le `.gitignore` ; le supprimer rétablit la disposition

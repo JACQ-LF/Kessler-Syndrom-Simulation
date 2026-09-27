@@ -145,13 +145,14 @@ double closest_approach(const Hermite& h) {
 }  // namespace
 
 double collision_radius_km(const Object& o, double scale) {
-    // SMALL < 0.1 m2, MEDIUM 0.1 - 1 m2, LARGE > 1 m2 de section radar.
-    // Valeurs indicatives a calibrer ; les objets sans categorie sont
-    // traites comme MEDIUM.
-    double r_m = 0.4;
-    if (o.rcs == "SMALL") r_m = 0.1;
-    else if (o.rcs == "LARGE") r_m = 2.0;
-    return r_m * 1e-3 * scale;
+    // La moitie de la dimension caracteristique : 0.1 / 0.4 / 2 m pour les
+    // categories SMALL / MEDIUM / LARGE du catalogue, L/2 pour un fragment.
+    return 0.5 * o.size_m * 1e-3 * scale;
+}
+
+State interpolate_state(const State& a, const State& b, double dt, double s) {
+    Hermite h{a.r, a.v * dt, b.r, b.v * dt};
+    return {h.pos(s), h.vel(s) * (1.0 / dt)};
 }
 
 std::vector<Conjunction> screen_step(const std::vector<State>& before,
