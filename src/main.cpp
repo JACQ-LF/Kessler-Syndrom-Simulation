@@ -22,6 +22,8 @@
 //   --min-vrel V         vitesse relative minimale d'une rencontre, en m/s (defaut 10) ;
 //                        en dessous, la paire vole de concert et n'est pas une rencontre
 //   --threads N          nombre de threads (defaut : tous les threads logiques)
+//   --gpu                grille et filtre des paires sur GPU (binaire compile avec
+//                        KESSLER_CUDA) ; resultats identiques au CPU
 //
 // Fragmentation (NASA Standard Breakup Model, voir src/core/breakup.hpp) :
 //   --breakup            les collisions detectees fragmentent les objets (implique --screen)
@@ -70,7 +72,7 @@ std::string csv_quote(const std::string& s) {
 
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
-    bool screen = false, breakup = false, conj_explicit = false;
+    bool screen = false, breakup = false, conj_explicit = false, want_gpu = false;
     int threads = 0;   // 0 = defaut d'OpenMP
     ScreeningConfig scfg;
     BreakupConfig bcfg;
@@ -103,6 +105,8 @@ int main(int argc, char** argv) {
             screen = conj_explicit = true;
         } else if (a == "--radius-scale" && k + 1 < argc) {
             scfg.radius_scale = std::atof(argv[++k]);
+        } else if (a == "--gpu") {
+            want_gpu = screen = true;
         } else if (a == "--threads" && k + 1 < argc) {
             threads = std::atoi(argv[++k]);
         } else if (a == "--min-vrel" && k + 1 < argc) {
@@ -234,15 +238,16 @@ int main(int argc, char** argv) {
     double t_prop = 0, t_screen = 0, t_grid = 0, t_pairs = 0;
     // Profil d'execution : ou part le temps, et combien de threads travaillent
     // vraiment pendant le parcours des paires.
-    double t_pairs_busy = 0, t_apply = 0, t_copy = 0;
+    double t_pairs_busy = 0, t_apply = 0, t_copy = 0, t_transfer = 0, t_refine = 0, t_wait = 0;
     int pair_threads = 1, max_cell_objects = 0;
+    bool used_gpu = false;
     std::ofstream prof_out;
     if (screen) {
         prof_out.open(OUT_DIR + "/profile.csv");
         prof_out << "t_h,objects,propagation_s,grid_s,pairs_s,pairs_threads_busy,"
-                    "breakup_s,other_s,max_cell_objects\n";
+                    "breakup_s,other_s,max_cell_objects,transfer_s\n";
     }
-    struct { double loop = 0, prop = 0, grid = 0, pairs = 0, busy = 0, apply = 0; int max_cell = 0; } hour;
+    struct { double loop = 0, prop = 0, grid = 0, pairs = 0, busy = 0, apply = 0, transfer = 0, wait = 0, refine = 0; int max_cell = 0; } hour;
     if (breakup && !conj_explicit) {
         // En mode fragmentation, seules les collisions importent : le seuil
         // se cale sur la plus grande somme de rayons possible. Un seuil plus
@@ -253,6 +258,8 @@ int main(int argc, char** argv) {
         for (const Object& o : sim.objects) max_size_m = std::max(max_size_m, o.size_m);
         scfg.threshold_km = max_size_m * 1e-3 * scfg.radius_scale;
     }
+    // Moteur de detection, garde d'un pas a l'autre (tampons, memoire GPU).
+    Screener screener(scfg);
     if (screen) {
         conj_out.open(OUT_DIR + "/conjunctions.csv");
         conj_out << "t_s,id1,id2,name1,name2,miss_km,v_rel_km_s,collision\n";
@@ -260,6 +267,13 @@ int main(int argc, char** argv) {
         std::cout << "Detection : seuil " << scfg.threshold_km * 1000.0 << " m"
                   << (breakup && !conj_explicit ? " (enveloppe de collision)" : "")
                   << ", rayons x" << scfg.radius_scale << "\n";
+        if (want_gpu) {
+            std::string message;
+            if (screener.set_gpu(true, &message))
+                std::cout << "Detection sur GPU : " << message << "\n";
+            else
+                std::cout << "GPU indisponible (" << message << ") : detection sur CPU.\n";
+        }
     }
 
     // --- Fragmentation ---
@@ -337,9 +351,14 @@ int main(int argc, char** argv) {
         }
         if (screen) {
             auto cc0 = clock::now();
-            before.resize(sim.objects.size());
-            for (size_t i = 0; i < sim.objects.size(); ++i) before[i] = sim.objects[i].s;
+            const int nobj = static_cast<int>(sim.objects.size());
+            before.resize(nobj);
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < nobj; ++i) before[i] = sim.objects[i].s;
             t_copy += std::chrono::duration<double>(clock::now() - cc0).count();
+            // Avec le GPU, sa grille et son pre-filtre tournent pendant la
+            // propagation qui suit ; sans GPU, begin() ne fait rien.
+            screener.begin(before, sim.objects, sim.dt);
         }
         double t0 = sim.t;
 
@@ -351,7 +370,7 @@ int main(int argc, char** argv) {
 
         if (screen) {
             ScreeningStats st;
-            std::vector<Conjunction> found = screen_step(before, sim.objects, t0, sim.dt, scfg, &st);
+            std::vector<Conjunction> found = screener.finish(before, sim.objects, t0, sim.dt, &st);
             t_screen += std::chrono::duration<double>(clock::now() - c1).count();
             total_candidates += st.candidate_pairs;
             total_refined += st.refined_pairs;
@@ -360,11 +379,18 @@ int main(int argc, char** argv) {
             t_grid += st.grid_s;
             t_pairs += st.pairs_s;
             t_pairs_busy += st.pairs_busy_s;
+            t_transfer += st.transfer_s;
+            t_refine += st.refine_s;
+            t_wait += st.wait_s;
+            used_gpu = used_gpu || st.gpu;
             pair_threads = st.threads;
             max_cell_objects = std::max(max_cell_objects, st.max_cell_objects);
             hour.grid += st.grid_s;
             hour.pairs += st.pairs_s;
             hour.busy += st.pairs_busy_s;
+            hour.transfer += st.transfer_s;
+            hour.wait += st.wait_s;
+            hour.refine += st.refine_s;
             hour.max_cell = std::max(hour.max_cell, st.max_cell_objects);
             for (const Conjunction& c : found) {
                 const Object& a = sim.objects[c.i];
@@ -392,11 +418,14 @@ int main(int argc, char** argv) {
         hour.loop += std::chrono::duration<double>(clock::now() - step_start).count();
         if (screen && static_cast<long>(sim.t / 3600.0) > profiled_hour) {
             profiled_hour = static_cast<long>(sim.t / 3600.0);
-            double other = hour.loop - hour.prop - hour.grid - hour.pairs - hour.apply;
+            // Sur GPU, grille, paires et transferts se deroulent pendant la
+            // propagation : seuls l'attente et l'affinage prennent du temps CPU.
+            double other = used_gpu ? hour.loop - hour.prop - hour.wait - hour.refine - hour.apply
+                                    : hour.loop - hour.prop - hour.grid - hour.pairs - hour.apply;
             prof_out << profiled_hour << ',' << sim.objects.size() << ',' << hour.prop << ','
                      << hour.grid << ',' << hour.pairs << ','
                      << (hour.pairs > 0 ? hour.busy / hour.pairs : 0.0) << ',' << hour.apply
-                     << ',' << other << ',' << hour.max_cell << std::endl;
+                     << ',' << other << ',' << hour.max_cell << ',' << hour.transfer << std::endl;
             hour = {};
         }
 
@@ -461,19 +490,33 @@ int main(int argc, char** argv) {
 
     if (screen) {
         // Ou part le temps, et ce que les threads font pendant le parcours.
-        double seq = t_grid + t_apply + t_copy;
-        double other = t_loop - t_prop - t_grid - t_pairs - t_apply - t_copy;
-        std::cout << std::fixed << std::setprecision(1)
+        auto pct = [&](double x) { return 100 * x / t_loop; };
+        std::cout << std::fixed << std::setprecision(2)
                   << "\n--- Profil d'execution (" << t_loop << " s au total) ---\n"
-                  << "  propagation        " << t_prop << " s  (" << 100 * t_prop / t_loop << " %)\n"
-                  << "  parcours des paires " << t_pairs << " s  (" << 100 * t_pairs / t_loop
-                  << " %), " << (t_pairs > 0 ? t_pairs_busy / t_pairs : 0.0) << " threads sur "
-                  << pair_threads << " occupes en moyenne\n"
-                  << "  grille (sequentiel) " << t_grid << " s  (" << 100 * t_grid / t_loop << " %)\n"
-                  << "  fragmentation      " << t_apply << " s  (" << 100 * t_apply / t_loop << " %)\n"
-                  << "  copie des etats    " << t_copy << " s\n"
-                  << "  reste (journaux)   " << other << " s\n"
-                  << "  phases sequentielles : " << 100 * seq / t_loop << " % du temps\n"
+                  << "  propagation          " << t_prop << " s  (" << pct(t_prop) << " %)\n";
+        double other;
+        if (used_gpu) {
+            // Le GPU travaille PENDANT la propagation : ses temps ne s'ajoutent
+            // pas au total. Seules l'attente et l'affinage le font.
+            other = t_loop - t_prop - t_wait - t_refine - t_apply - t_copy;
+            const double gpu_total = t_grid + (t_pairs - t_refine) + t_transfer;
+            std::cout << "  attente du GPU       " << t_wait << " s  (" << pct(t_wait) << " %)\n"
+                      << "  affinage (CPU)       " << t_refine << " s  (" << pct(t_refine) << " %)\n"
+                      << "  -- sur le GPU, en parallele de la propagation : " << gpu_total
+                      << " s (grille " << t_grid << ", paires " << t_pairs - t_refine
+                      << ", transferts " << t_transfer << ")\n"
+                      << "  -- recouvrement : " << std::max(0.0, gpu_total - t_wait) << " s de calcul GPU cache"
+                      << " derriere la propagation\n";
+        } else {
+            other = t_loop - t_prop - t_grid - t_pairs - t_apply - t_copy;
+            std::cout << "  grille               " << t_grid << " s  (" << pct(t_grid) << " %)\n"
+                      << "  parcours des paires  " << t_pairs << " s  (" << pct(t_pairs) << " %), "
+                      << (t_pairs > 0 ? t_pairs_busy / t_pairs : 0.0) << " threads sur "
+                      << pair_threads << " occupes en moyenne\n";
+        }
+        std::cout << "  fragmentation        " << t_apply << " s  (" << pct(t_apply) << " %)\n"
+                  << "  copie des etats      " << t_copy << " s  (" << pct(t_copy) << " %)\n"
+                  << "  reste (journaux)     " << other << " s  (" << pct(other) << " %)\n"
                   << "  cellule la plus peuplee : " << max_cell_objects << " objets\n"
                   << "Detail heure par heure dans " << OUT_DIR << "/profile.csv\n"
                   << std::defaultfloat << std::setprecision(6);

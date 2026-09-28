@@ -218,7 +218,9 @@ struct App {
     // --- Detection des rapprochements (mode Live seulement) ---
     bool detect = false;
     bool show_grid = false;          // trace les cellules de la grille de detection
-    ScreeningConfig screen_cfg;
+    ScreeningConfig screen_cfg;      // reglages de l'interface, recopies dans le Screener
+    Screener screener;               // garde ses tampons (et sa memoire GPU) d'un pas a l'autre
+    std::string gpu_message;         // nom du GPU, ou raison de son indisponibilite
     std::vector<State> before;       // etats en debut de pas, pour screen_step
     ScreeningStats last_stats;
     double detect_ms = 0.0;          // moyenne glissante, par pas
@@ -248,7 +250,9 @@ struct App {
     float impact_mass_kg = 10.0f;
     float impact_vrel_km_s = 10.0f;
 
-    std::vector<Conjunction> run_detection(double t0) {
+    // Reglages du pas, a fixer AVANT Screener::begin() : ils ne doivent pas
+    // changer entre le lancement du GPU et la recuperation du resultat.
+    void prepare_detection() {
         if (breakup) {
             // Meme regle que la ligne de commande : en mode fragmentation, le
             // seuil colle a l'enveloppe de collision (plus grande somme de
@@ -258,9 +262,15 @@ struct App {
             for (const Object& o : sim.objects) max_size_m = std::max(max_size_m, o.size_m);
             screen_cfg.threshold_km = max_size_m * 1e-3 * screen_cfg.radius_scale;
         }
+        screener.config() = screen_cfg;
+    }
+
+    // Termine la detection du pas lancee par Screener::begin(). Le temps
+    // mesure est celui que le CPU y passe : avec le GPU, l'attente et
+    // l'affinage seulement, le reste s'etant deroule pendant la propagation.
+    std::vector<Conjunction> run_detection(double t0) {
         auto c0 = std::chrono::steady_clock::now();
-        std::vector<Conjunction> found =
-            screen_step(before, sim.objects, t0, sim.dt, screen_cfg, &last_stats);
+        std::vector<Conjunction> found = screener.finish(before, sim.objects, t0, sim.dt, &last_stats);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - c0).count();
         detect_ms = detect_ms > 0 ? 0.9 * detect_ms + 0.1 * ms : ms;
@@ -290,8 +300,12 @@ struct App {
     // Un pas de simulation en mode Live avec detection, et fragmentation si
     // elle est active.
     void live_step() {
-        before.resize(sim.objects.size());
-        for (size_t i = 0; i < sim.objects.size(); ++i) before[i] = sim.objects[i].s;
+        const int n = static_cast<int>(sim.objects.size());
+        before.resize(n);
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; ++i) before[i] = sim.objects[i].s;
+        prepare_detection();
+        screener.begin(before, sim.objects, sim.dt);   // GPU : tourne pendant la propagation
         double t0 = sim.t;
         sim.step();
         std::vector<Conjunction> found = run_detection(t0);
@@ -590,6 +604,19 @@ void draw_detection_panel(App& app) {
     ImGui::Checkbox("Detection active", &app.detect);
     ImGui::SameLine();
     ImGui::TextDisabled("(%.1f ms/pas)", app.detect_ms);
+
+    // Backend GPU : seulement si le binaire a ete compile avec CUDA.
+    if (Screener::gpu_compiled()) {
+        bool on = app.screener.gpu();
+        if (ImGui::Checkbox("GPU (CUDA)", &on)) app.screener.set_gpu(on, &app.gpu_message);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", app.screener.gpu() ? app.gpu_message.c_str()
+                                                      : (app.gpu_message.empty() ? "CPU"
+                                                                                 : app.gpu_message.c_str()));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Grille et pre-filtre des paires sur le GPU, pendant que le CPU\n"
+                              "propage. Resultats identiques au CPU, au bit pres.");
+    }
     if (app.detect && app.steps_per_frame > 3)
         ImGui::TextColored({1.0f, 0.75f, 0.3f, 1.0f},
                            "%d pas par image : ~%.0f ms d'analyse par image.",
@@ -873,7 +900,8 @@ int main(int argc, char** argv) {
     std::string screenshot;
     int screenshot_frames = 45;
 
-    bool start_play = false, start_detect = false, start_grid = false, start_breakup = false;
+    bool start_play = false, start_detect = false, start_grid = false, start_breakup = false,
+         start_gpu = false;
     double start_scale = 1.0;
     int threads = 0;   // 0 = defaut d'OpenMP
     int impact_id = -1;
@@ -889,6 +917,7 @@ int main(int argc, char** argv) {
         else if (a == "--grid") start_grid = true;
         else if (a == "--radius-scale" && i + 1 < argc) start_scale = std::atof(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+        else if (a == "--gpu") start_gpu = true;
         else if (a == "--masses" && i + 1 < argc) masses_path = argv[++i];
         else if (a == "--impact" && i + 1 < argc) impact_id = std::atoi(argv[++i]);
         else if (a == "--impact-mass" && i + 1 < argc) impact_mass = std::atof(argv[++i]);
@@ -904,6 +933,12 @@ int main(int argc, char** argv) {
     app.breakup = start_breakup;
     app.show_grid = start_grid;
     app.screen_cfg.radius_scale = start_scale;
+    if (start_gpu) {
+        if (app.screener.set_gpu(true, &app.gpu_message))
+            std::printf("Detection sur GPU : %s\n", app.gpu_message.c_str());
+        else
+            std::printf("GPU indisponible (%s) : detection sur CPU.\n", app.gpu_message.c_str());
+    }
     app.catalog_path = catalog;
     int dropped = 0;
     app.sim.objects = load_catalog(catalog, &dropped);

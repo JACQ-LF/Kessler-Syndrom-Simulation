@@ -6,9 +6,11 @@ output/
 
 # Disposition des fenetres du viewer, propre a chaque poste
 imgui.ini
+OBSERVATIONS KESSLER SYNDROM.docx
 
-# Build
+# Build (build/ pour MinGW, build-cuda/ pour MSVC + CUDA)
 build/
+build-*/
 *.exe
 *.o
 *.obj
