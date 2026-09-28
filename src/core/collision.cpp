@@ -309,20 +309,53 @@ struct Screener::Impl {
 
 #ifdef KESSLER_HAS_CUDA
     gpu::Context* gpu = nullptr;
-    std::vector<unsigned char> alive;
     std::vector<std::pair<int, int>> survivors;
     ~Impl() { gpu::destroy(gpu); }
 #endif
+    bool launched = false;       // travail GPU en cours, lance par begin()
+    double launched_cell = 0.0;
 
     // Grille et parcours sur CPU.
     void screen_cpu(const std::vector<State>& before, const std::vector<Object>& after,
                     double t0, double dt, double cell, const ScreeningConfig& cfg,
                     ScreeningStats& st);
-    // Grille et filtre sur GPU, affinage sur CPU. false en cas d'erreur CUDA.
-    bool screen_gpu(const std::vector<State>& before, const std::vector<Object>& after,
-                    double t0, double dt, double cell, const ScreeningConfig& cfg,
-                    ScreeningStats& st, std::string* message);
+    // Lance la grille et le pre-filtre sur GPU, sans attendre.
+    bool gpu_launch(const std::vector<State>& before, const std::vector<Object>& objects,
+                    double dt, double cell, const ScreeningConfig& cfg, std::string* message);
+    // Attend le GPU, puis filtre exact et affinage sur CPU.
+    bool gpu_finish(const std::vector<State>& before, const std::vector<Object>& after,
+                    double t0, double dt, const ScreeningConfig& cfg, ScreeningStats& st,
+                    std::string* message);
 };
+
+namespace {
+
+// Taille de cellule : deux objets qui se rapprochent a moins du seuil
+// pendant le pas etaient, en debut de pas, a moins de
+// v_rel,max * dt + seuil + ecart a la ligne droite. Avec une cellule au
+// moins aussi grande, ils sont dans la meme cellule ou dans une voisine.
+// Une cellule plus grande que necessaire ne change pas les resultats, seulement
+// le nombre de paires examinees.
+double cell_size(const std::vector<State>& before, const std::vector<Object>& objects,
+                 double dt, double threshold_km) {
+    const int n = static_cast<int>(before.size());
+    std::vector<double> vmax_thread(thread_count(), 0.0);
+    #pragma omp parallel
+    {
+        double v = 0.0;
+        #pragma omp for schedule(static) nowait
+        for (int i = 0; i < n; ++i)
+            if (objects[i].alive) v = std::max(v, norm(before[i].v));
+        vmax_thread[thread_id()] = v;
+    }
+    double vmax = 0.0;
+    for (double v : vmax_thread) vmax = std::max(vmax, v);
+    const double vrel_max = 2.0 * vmax;
+    return std::max(1.0, vrel_max * dt + threshold_km
+                             + GRAVITY_GRADIENT * vrel_max * dt * dt * dt);
+}
+
+}  // namespace
 
 void Screener::Impl::screen_cpu(const std::vector<State>& before, const std::vector<Object>& after,
                                 double t0, double dt, double cell, const ScreeningConfig& cfg,
@@ -529,53 +562,103 @@ void Screener::Impl::screen_cpu(const std::vector<State>& before, const std::vec
     st.max_cell_pairs = static_cast<long long>(max_cell) * (max_cell - 1) / 2;
 }
 
-bool Screener::Impl::screen_gpu(const std::vector<State>& before, const std::vector<Object>& after,
-                                double t0, double dt, double cell, const ScreeningConfig& cfg,
-                                ScreeningStats& st, std::string* message) {
+bool Screener::Impl::gpu_launch(const std::vector<State>& before, const std::vector<Object>& objects,
+                                double dt, double cell, const ScreeningConfig& cfg,
+                                std::string* message) {
 #ifdef KESSLER_HAS_CUDA
     const int n = static_cast<int>(before.size());
-    alive.resize(n);
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; ++i) alive[i] = after[i].alive ? 1 : 0;
+
+    // Etats et vivants ecrits directement, en parallele, dans la memoire
+    // verrouillee du GPU : une recopie sequentielle de ~2 Mo par pas mangeait
+    // le gain du recouvrement.
+    State* h_states = nullptr;
+    unsigned char* h_alive = nullptr;
+    if (!gpu::staging(gpu, n, &h_states, &h_alive, message)) return false;
+    int alive_count = 0;
+    #pragma omp parallel for schedule(static) reduction(+ : alive_count)
+    for (int i = 0; i < n; ++i) {
+        h_states[i] = before[i];
+        h_alive[i] = objects[i].alive ? 1 : 0;
+        alive_count += h_alive[i];
+    }
 
     gpu::FilterParams params;
     params.cell_km = cell;
     params.dt = dt;
     params.threshold_km = cfg.threshold_km;
     params.vmin2 = cfg.min_encounter_speed_km_s * cfg.min_encounter_speed_km_s;
-    gpu::FilterReport report;
-    if (!gpu::filter(gpu, before.data(), alive.data(), n, params, survivors, report, message))
-        return false;
+    if (!gpu::launch(gpu, n, alive_count, params, message)) return false;
+    launched = true;
+    launched_cell = cell;
+    return true;
+#else
+    (void)before; (void)objects; (void)dt; (void)cell; (void)cfg;
+    if (message) *message = "support GPU non compile";
+    return false;
+#endif
+}
 
-    // Affinage des paires retenues, en double precision, sur CPU : meme code
-    // que le backend CPU, donc memes resultats.
+bool Screener::Impl::gpu_finish(const std::vector<State>& before, const std::vector<Object>& after,
+                                double t0, double dt, const ScreeningConfig& cfg, ScreeningStats& st,
+                                std::string* message) {
+#ifdef KESSLER_HAS_CUDA
+    launched = false;
+    gpu::FilterReport report;
+    if (!gpu::collect(gpu, survivors, report, message)) return false;
+
+    // Le GPU n'a fait qu'un pre-filtre conservateur en simple precision : les
+    // paires qu'il garde repassent par le filtre exact en double, puis par
+    // l'affinage. Memes fonctions que le backend CPU, donc memes resultats.
+    // Le GPU a travaille sur les vivants de DEBUT de pas : une paire dont un
+    // objet est mort pendant le pas (rentree) est ecartee ici, comme le fait
+    // la grille du backend CPU, construite sur les vivants de fin de pas.
     const auto t_refine = Clock::now();
     const int nthreads = thread_count();
     found.resize(nthreads);
     for (auto& f : found) f.clear();
     const int ns = static_cast<int>(survivors.size());
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int k = 0; k < ns; ++k) {
-        Conjunction c;
-        if (refine_pair(before, after, survivors[k].first, survivors[k].second, t0, dt, cfg, c))
-            found[thread_id()].push_back(c);
+    const double vmin2 = cfg.min_encounter_speed_km_s * cfg.min_encounter_speed_km_s;
+    long long refined = 0, co_orbiting = 0;
+    #pragma omp parallel
+    {
+        long long my_refined = 0, my_co = 0;
+        std::vector<Conjunction>& out = found[thread_id()];
+        #pragma omp for schedule(dynamic, 64) nowait
+        for (int k = 0; k < ns; ++k) {
+            const int i = survivors[k].first, j = survivors[k].second;
+            if (!after[i].alive || !after[j].alive) continue;
+            const int r = filter(before, i, j, dt, cfg.threshold_km, vmin2);
+            if (r == FILTER_CO_ORBITING) { ++my_co; continue; }
+            if (r != FILTER_REFINE) continue;
+            ++my_refined;
+            Conjunction c;
+            if (refine_pair(before, after, i, j, t0, dt, cfg, c)) out.push_back(c);
+        }
+        #pragma omp atomic
+        refined += my_refined;
+        #pragma omp atomic
+        co_orbiting += my_co;
     }
     st.refine_s = seconds_since(t_refine);
 
+    // Temps GPU chronometres par le GPU lui-meme : ils se deroulent pendant
+    // la propagation. Seul wait_s est du temps perdu par le CPU.
     st.gpu = true;
+    st.cell_km = launched_cell;
     st.grid_s = report.grid_s;
     st.pairs_s = report.kernel_s + st.refine_s;
     st.transfer_s = report.upload_s + report.download_s;
+    st.wait_s = report.wait_s;
     st.pairs_busy_s = 0.0;
     st.threads = 0;
     st.candidate_pairs = report.candidates;
-    st.refined_pairs = ns;
-    st.co_orbiting = report.co_orbiting;
+    st.refined_pairs = refined;
+    st.co_orbiting = co_orbiting;
     st.max_cell_objects = report.max_cell;
     st.max_cell_pairs = static_cast<long long>(report.max_cell) * (report.max_cell - 1) / 2;
     return true;
 #else
-    (void)before; (void)after; (void)t0; (void)dt; (void)cell; (void)cfg; (void)st;
+    (void)before; (void)after; (void)t0; (void)dt; (void)cfg; (void)st;
     if (message) *message = "support GPU non compile";
     return false;
 #endif
@@ -597,8 +680,9 @@ bool Screener::gpu_compiled() {
 bool Screener::set_gpu(bool on, std::string* message) {
 #ifdef KESSLER_HAS_CUDA
     if (!on) {
-        gpu::destroy(impl_->gpu);
+        gpu::destroy(impl_->gpu);   // attend un eventuel travail en cours
         impl_->gpu = nullptr;
+        impl_->launched = false;
         return true;
     }
     if (impl_->gpu) return true;
@@ -619,41 +703,38 @@ bool Screener::gpu() const {
 #endif
 }
 
+void Screener::begin(const std::vector<State>& before, const std::vector<Object>& objects, double dt) {
+    impl_->launched = false;
+    if (!gpu()) return;
+    std::string message;
+    const double cell = cell_size(before, objects, dt, cfg_.threshold_km);
+    // Une erreur CUDA ne doit pas arreter la simulation : on repasse
+    // definitivement sur CPU, et finish() fera tout le travail.
+    if (!impl_->gpu_launch(before, objects, dt, cell, cfg_, &message)) set_gpu(false);
+}
+
 std::vector<Conjunction> Screener::screen(const std::vector<State>& before,
                                           const std::vector<Object>& after,
                                           double t0, double dt, ScreeningStats* stats) {
+    begin(before, after, dt);
+    return finish(before, after, t0, dt, stats);
+}
+
+std::vector<Conjunction> Screener::finish(const std::vector<State>& before,
+                                          const std::vector<Object>& after,
+                                          double t0, double dt, ScreeningStats* stats) {
     ScreeningStats st;
-    const int n = static_cast<int>(before.size());
-
-    // Taille de cellule : deux objets qui se rapprochent a moins du seuil
-    // pendant le pas etaient, en debut de pas, a moins de
-    // v_rel,max * dt + seuil + ecart a la ligne droite. Avec une cellule au
-    // moins aussi grande, ils sont dans la meme cellule ou dans une voisine.
-    std::vector<double> vmax_thread(thread_count(), 0.0);
-    #pragma omp parallel
-    {
-        double v = 0.0;
-        #pragma omp for schedule(static) nowait
-        for (int i = 0; i < n; ++i)
-            if (after[i].alive) v = std::max(v, norm(before[i].v));
-        vmax_thread[thread_id()] = v;
-    }
-    double vmax = 0.0;
-    for (double v : vmax_thread) vmax = std::max(vmax, v);
-    const double vrel_max = 2.0 * vmax;
-    const double cell = std::max(1.0, vrel_max * dt + cfg_.threshold_km
-                                          + GRAVITY_GRADIENT * vrel_max * dt * dt * dt);
-    st.cell_km = cell;
-
     bool done = false;
-    if (gpu()) {
+    if (impl_->launched) {
         std::string message;
-        done = impl_->screen_gpu(before, after, t0, dt, cell, cfg_, st, &message);
-        // Une erreur CUDA ne doit pas arreter la simulation : on repasse
-        // definitivement sur CPU.
+        done = impl_->gpu_finish(before, after, t0, dt, cfg_, st, &message);
         if (!done) set_gpu(false);
     }
-    if (!done) impl_->screen_cpu(before, after, t0, dt, cell, cfg_, st);
+    if (!done) {
+        st = ScreeningStats{};
+        st.cell_km = cell_size(before, after, dt, cfg_.threshold_km);
+        impl_->screen_cpu(before, after, t0, dt, st.cell_km, cfg_, st);
+    }
 
     std::vector<Conjunction> out;
     for (auto& f : impl_->found) out.insert(out.end(), f.begin(), f.end());

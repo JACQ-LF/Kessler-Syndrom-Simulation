@@ -54,6 +54,7 @@ struct ScreeningStats {
     double pairs_busy_s = 0.0;      // somme des temps de travail des threads sur les paires
     double refine_s = 0.0;          // temps d'affinage (inclus dans pairs_s sur CPU)
     double transfer_s = 0.0;        // transferts CPU <-> GPU
+    double wait_s = 0.0;            // attente du GPU par le CPU (part non recouverte par la propagation)
     int threads = 1;                // threads engages dans le parcours
     int max_cell_objects = 0;       // objets dans la cellule la plus peuplee
     long long max_cell_pairs = 0;   // paires candidates issues de cette seule cellule
@@ -95,8 +96,20 @@ public:
     // Rapprochements survenus pendant le pas [t0, t0 + dt], connaissant les
     // etats en debut de pas (`before`) et en fin de pas (`after`, apres
     // Simulation::step). Chaque rapprochement est rapporte une seule fois,
-    // dans le pas qui contient son TCA. Resultat trie par instant.
+    // dans le pas qui contient son TCA. Resultat trie par (instant, paire).
     std::vector<Conjunction> screen(const std::vector<State>& before,
+                                    const std::vector<Object>& after,
+                                    double t0, double dt, ScreeningStats* stats = nullptr);
+
+    // La meme chose en deux temps, pour que le GPU travaille PENDANT que le
+    // CPU propage : son pre-filtre n'a besoin que des etats de debut de pas.
+    //     screener.begin(before, sim.objects, dt);   // lance le GPU, rend la main
+    //     sim.step();                                // CPU et GPU en parallele
+    //     screener.finish(before, sim.objects, t0, dt);
+    // `objects` dans begin() : l'etat de la simulation AVANT le pas. Sans GPU,
+    // begin() ne fait rien et finish() fait tout le travail.
+    void begin(const std::vector<State>& before, const std::vector<Object>& objects, double dt);
+    std::vector<Conjunction> finish(const std::vector<State>& before,
                                     const std::vector<Object>& after,
                                     double t0, double dt, ScreeningStats* stats = nullptr);
 

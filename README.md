@@ -18,6 +18,7 @@ de collisions, fragmentation, cascade.
 | Tracés matplotlib (trajectoires, instantanés) | fait |
 | Détection des rapprochements et collisions (déterministe) | fait |
 | Fragmentation (NASA Standard Breakup Model), impacts provoqués | fait |
+| Détection sur GPU (CUDA), en parallèle de la propagation | fait (optionnel) |
 | Traînée atmosphérique | à faire — indispensable pour un seuil de Kessler |
 | Collisions probabilistes (méthode CUBE), pour les runs longs | à faire |
 
@@ -29,6 +30,8 @@ de collisions, fragmentation, cascade.
 │   ├── core/orbital.*      dynamique partagée : RK4, J2, Lune, entrées/sorties
 │   ├── core/collision.*    détection des rapprochements : grille + instant de rapprochement
 │   ├── core/breakup.*      fragmentation (NASA Standard Breakup Model), masses
+│   ├── core/collision_filter.hpp  filtre des paires, commun au CPU et au GPU
+│   ├── core/collision_gpu.*       backend CUDA de la détection (optionnel)
 │   ├── core/threads.*      choix du nombre de threads
 │   ├── main.cpp            simulation en ligne de commande
 │   └── viewer/viewer.cpp   viewer 3D temps réel (raylib + Dear ImGui)
@@ -70,7 +73,7 @@ cmake --build build
 Sans CMake du tout, la simulation seule se compile en une ligne :
 
 ```bash
-g++ -O2 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/core/collision.cpp src/main.cpp -o kessler_sim
+g++ -O3 -std=c++17 -fopenmp -Isrc src/core/orbital.cpp src/core/collision.cpp src/core/breakup.cpp src/core/threads.cpp src/main.cpp -o kessler_sim
 ```
 
 Sur MSYS2, CMake s'installe avec :
@@ -78,6 +81,25 @@ Sur MSYS2, CMake s'installe avec :
 ```bash
 pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
 ```
+
+### Avec le GPU (CUDA)
+
+La grille et le filtre des paires peuvent tourner sur un GPU NVIDIA. Il faut
+le CUDA Toolkit, et sous Windows **Visual Studio** : `nvcc` n'accepte pas MinGW
+comme compilateur hôte. Ce build se fait donc dans un dossier à part :
+
+```bash
+cmake -B build-cuda -G "Visual Studio 17 2022" -A x64 -DKESSLER_CUDA=ON
+```
+
+```bash
+cmake --build build-cuda --config Release
+```
+
+Les binaires produits remplacent ceux de la racine ; ils gardent le chemin CPU
+et n'utilisent le GPU qu'avec l'option `--gpu`. Le dernier build compilé
+l'emporte : recompiler avec `cmake --build build` revient à la version MinGW,
+sans GPU.
 
 Puis, **depuis la racine du dépôt** (les chemins sont relatifs au répertoire
 courant). Sous Windows, remplacez `./kessler_sim` par `.\kessler_sim.exe` :
@@ -123,6 +145,7 @@ instant, identifiants, distance de passage, vitesse relative.
 | `--radius-scale S` | 1 | multiplie tous les rayons de collision |
 | `--min-vrel V` | 10 | vitesse relative minimale d'une rencontre, en m/s |
 | `--threads N` | tous | nombre de threads OpenMP |
+| `--gpu` | — | grille et filtre des paires sur GPU (build CUDA) |
 
 **Principe.** Une grille de hachage ne retient que les paires assez proches en
 début de pas pour pouvoir se rencontrer pendant le pas — la taille de cellule
@@ -230,9 +253,12 @@ plus chargée. Deux régimes ressortent :
 | Threads occupés sur les paires | 13,9 / 16 | 15,5 / 16 |
 | Cellule la plus peuplée | 13 objets | 1 837 objets |
 
-Sur le catalogue seul, la moitié du temps est séquentielle : le CPU plafonne
-autour de 45 % d'occupation. Paralléliser la construction de la grille est la
-prochaine étape de ce côté.
+Sur le catalogue seul, la moitié du temps était séquentielle : le CPU plafonnait
+autour de 45 % d'occupation. La grille est désormais conservée d'un pas à
+l'autre (plus de réallocation à chaque pas), ce qui la rend deux fois plus
+rapide ; au-delà de 150 000 objets, un tri par base parallèle prend le relais.
+En dessous, les barrières de synchronisation coûtaient plus cher que le tri
+lui-même : 1,7 ms avec 16 threads contre 0,6 ms avec un seul, à 28 000 clés.
 
 **Le pic après une fragmentation.** Juste après une collision, les fragments
 sont entassés dans une seule cellule. Au pas qui suivait un impact de 519
@@ -251,6 +277,47 @@ thread au travail sur 16. Deux causes, deux corrections :
   autant qu'un pas ordinaire.
 
 Résultats inchangés au bit près : mêmes rapprochements, même cascade.
+
+### Sur GPU
+
+Avec `--gpu` (build CUDA), la grille et le filtre des paires passent sur la
+carte graphique, **pendant que le CPU propage** : le filtre n'a besoin que des
+états de début de pas. Le CPU ne fait plus que l'affinage des rares paires
+retenues.
+
+| Cascade ×100, 12 h, dt = 30 s | Durée |
+|---|---|
+| CPU, build MinGW | 25,6 s |
+| CPU, build MSVC | ~27 s |
+| GPU, filtre en double précision | 11,6 s |
+| GPU, pré-filtre en simple précision | 9,5 s |
+| **GPU, en parallèle de la propagation** | **8,0 s** |
+
+Mesures sur RTX 3050 Laptop (GA107). Sur le catalogue seul (28 000 objets), le
+gain est modeste : trop peu de travail pour amortir transferts et lancements.
+
+Trois choix de conception :
+
+- **Répartition par objets.** Un thread GPU par objet, dans l'ordre trié par
+  cellule : les threads d'un même warp ont des voisinages proches. Une
+  répartition par cellule donnerait tout le travail d'un nuage frais à un seul
+  thread, et bloquerait les 31 autres de son warp.
+- **Pré-filtre en simple précision.** Sur les GPU grand public, la double
+  précision tourne à 1/64 de la simple : le filtre en double était plus lent
+  sur GPU que sur CPU. Le GPU applique donc un pré-filtre en float,
+  *conservateur* — il ne rejette que ce que le filtre exact rejetterait à coup
+  sûr, avec des marges couvrant l'erreur d'arrondi — et le CPU repasse le
+  filtre exact en double sur les survivantes. Vérifié sur 21 millions de paires
+  candidates réelles (catalogue, nuages frais, nuages d'une heure, dt de 10 à
+  60 s) : aucune paire perdue.
+- **Données compactes et contiguës.** Positions relatives au coin de la
+  cellule, en float (32 octets par objet au lieu de 48), rangées dans l'ordre
+  trié : les voisins sont contigus en mémoire. Le noyau des paires est passé de
+  5,8 à 2,8 s sur la cascade de 12 h.
+
+**Résultats identiques au bit près** entre CPU et GPU, rapprochements comme
+fragmentations : le filtre exact est le même code (`collision_filter.hpp`),
+compilé sans contraction FMA des deux côtés.
 
 ## Fragmentation
 
@@ -326,36 +393,45 @@ Sur un cas type Iridium 33 / Cosmos 2251 (950 kg + 560 kg à 11,7 km/s) :
 | Isotropie (moyenne des directions, 13 382 fragments) | 0,0071 | ~0,008 (bruit statistique) |
 
 Le SBM sous-estime ce cas précis d'environ un facteur 2 : l'ordre de grandeur
-est bon. Même graine, mêmes fragments : un run est exactement reproductible.
+est bon.
+
+**Reproductible partout.** Même graine, mêmes fragments — et ce quel que soit le
+compilateur ou le backend. Le standard C++ fixe le générateur `mt19937_64` bit
+à bit, mais pas les distributions : `std::normal_distribution` ou
+`std::poisson_distribution` diffèrent entre libstdc++ (MinGW) et la
+bibliothèque de Microsoft, et la même graine donnait deux cascades. Les tirages
+passent donc par des implémentations explicites (uniforme sur 53 bits,
+Box-Muller, Poisson par l'algorithme PTRS de Hörmann). Vérifié : MinGW, MSVC
+sur CPU et MSVC sur GPU donnent la même cascade, ligne à ligne.
 
 **La cascade entière est indépendante du pas.** Sur 6 h à rayons ×100, les
-mêmes 51 fragmentations — mêmes paires, à la même seconde — à dt = 10 s et à
+mêmes 62 fragmentations — mêmes paires, à la même seconde — à dt = 10 s et à
 dt = 30 s.
 
 ### Une cascade, heure par heure
 
 `--breakup --radius-scale 100`, dt = 30 s, sans impact provoqué — les
-collisions surviennent d'elles-mêmes (run arrêté à 28 h) :
+collisions surviennent d'elles-mêmes :
 
 | Tranche | Fragmentations | Cumul | Fragments créés (cumul) |
 |---|---|---|---|
-| 0–4 h | 22 | 22 | 10 879 |
-| 4–8 h | 59 | 81 | ~30 000 |
-| 8–12 h | 97 | 178 | 57 865 |
-| 12–16 h | 144 | 322 | 92 151 |
-| 16–20 h | 187 | 509 | 125 699 |
-| 20–24 h | 312 | 821 | 175 464 |
-| 24–28 h | 325 | 1 146 | 237 253 |
+| 0–4 h | 36 | 36 | 14 635 |
+| 4–8 h | 62 | 98 | 36 921 |
+| 8–12 h | 102 | 200 | 63 305 |
+| 12–16 h | 178 | 378 | 97 335 |
+| 16–20 h | 175 | 553 | 130 305 |
+| 20–24 h | 245 | 798 | 179 032 |
+| 24–28 h | 384 | 1 182 | 250 780 |
 
 Le rythme s'accélère, et la nature des collisions change : au début les
-objets du catalogue se percutent entre eux ; à 28 h, 761 fragmentations
-opposent un objet du catalogue à un fragment et 232 deux fragments, contre 153
+objets du catalogue se percutent entre eux ; sur 28 h, 788 fragmentations
+opposent un objet du catalogue à un fragment et 240 deux fragments, contre 154
 entre objets du catalogue. **Les débris deviennent les projectiles** : c'est le
 mécanisme de Kessler.
 
-Le coût suit : la population passe de 28 000 à plus de 260 000 objets, et le
-parcours des paires croît en N². Les premières heures se simulent en quelques
-secondes ; au-delà de 24 h, chaque heure simulée prend plusieurs minutes.
+Le coût suit : la population passe de 28 000 à plus de 250 000 objets, et le
+parcours des paires croît en N². Sur GPU, ces 28 h se simulent en 50 s ; en
+CPU, il fallait plusieurs minutes par heure simulée passé 24 h.
 
 ### Deux réglages de performance
 
@@ -458,6 +534,11 @@ retire tous les fragments.
 affiche la grille, `--radius-scale S` multiplie les rayons de collision, et
 `--impact NORAD` (avec `--impact-mass`, `--impact-vrel`) frappe un objet au
 démarrage.
+
+**GPU.** Avec un build CUDA, la case *GPU (CUDA)* du panneau *Rapprochements*
+(ou `--gpu` au lancement) fait tourner la détection sur la carte graphique,
+pendant que le CPU propage. Le temps affiché par pas est alors celui que le CPU
+passe réellement à attendre et à affiner.
 
 Le viewer écrit un `imgui.ini` à la racine pour mémoriser la disposition des
 panneaux. Il est dans le `.gitignore` ; le supprimer rétablit la disposition

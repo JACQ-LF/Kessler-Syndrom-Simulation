@@ -67,6 +67,22 @@ void assign_masses(std::vector<Object>& objs, const MassTable& table);
 // Fragmentation
 // ---------------------------------------------------------------------------
 
+// Tirages aleatoires reproductibles d'un compilateur a l'autre. Le standard
+// C++ fixe le generateur mt19937_64 bit a bit, mais pas les distributions :
+// std::normal_distribution ou std::poisson_distribution different entre
+// libstdc++ (MinGW) et la bibliotheque de Microsoft, et la meme graine
+// donnait deux cascades differentes selon le compilateur.
+class PortableRng {
+public:
+    explicit PortableRng(std::uint64_t seed) : engine_(seed) {}
+    double uniform();                 // [0, 1), 53 bits
+    double normal();                  // N(0, 1), Box-Muller
+    long long poisson(double mean);   // Knuth (petite moyenne), PTRS de Hormann sinon
+
+private:
+    std::mt19937_64 engine_;
+};
+
 struct BreakupConfig {
     double lc_m = 0.10;                  // plus petit fragment suivi (m)
     double catastrophic_j_per_g = 40.0;  // seuil d'energie specifique
@@ -130,7 +146,7 @@ private:
     double sample_area_to_mass_log(double log_l);
 
     BreakupConfig cfg_;
-    std::mt19937_64 rng_;
+    PortableRng rng_;
     int next_event_ = 0;
     int next_id_ = FRAGMENT_ID_BASE;
     long long fragments_created_ = 0;

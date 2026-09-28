@@ -238,7 +238,7 @@ int main(int argc, char** argv) {
     double t_prop = 0, t_screen = 0, t_grid = 0, t_pairs = 0;
     // Profil d'execution : ou part le temps, et combien de threads travaillent
     // vraiment pendant le parcours des paires.
-    double t_pairs_busy = 0, t_apply = 0, t_copy = 0, t_transfer = 0, t_refine = 0;
+    double t_pairs_busy = 0, t_apply = 0, t_copy = 0, t_transfer = 0, t_refine = 0, t_wait = 0;
     int pair_threads = 1, max_cell_objects = 0;
     bool used_gpu = false;
     std::ofstream prof_out;
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
         prof_out << "t_h,objects,propagation_s,grid_s,pairs_s,pairs_threads_busy,"
                     "breakup_s,other_s,max_cell_objects,transfer_s\n";
     }
-    struct { double loop = 0, prop = 0, grid = 0, pairs = 0, busy = 0, apply = 0, transfer = 0; int max_cell = 0; } hour;
+    struct { double loop = 0, prop = 0, grid = 0, pairs = 0, busy = 0, apply = 0, transfer = 0, wait = 0, refine = 0; int max_cell = 0; } hour;
     if (breakup && !conj_explicit) {
         // En mode fragmentation, seules les collisions importent : le seuil
         // se cale sur la plus grande somme de rayons possible. Un seuil plus
@@ -356,6 +356,9 @@ int main(int argc, char** argv) {
             #pragma omp parallel for schedule(static)
             for (int i = 0; i < nobj; ++i) before[i] = sim.objects[i].s;
             t_copy += std::chrono::duration<double>(clock::now() - cc0).count();
+            // Avec le GPU, sa grille et son pre-filtre tournent pendant la
+            // propagation qui suit ; sans GPU, begin() ne fait rien.
+            screener.begin(before, sim.objects, sim.dt);
         }
         double t0 = sim.t;
 
@@ -367,7 +370,7 @@ int main(int argc, char** argv) {
 
         if (screen) {
             ScreeningStats st;
-            std::vector<Conjunction> found = screener.screen(before, sim.objects, t0, sim.dt, &st);
+            std::vector<Conjunction> found = screener.finish(before, sim.objects, t0, sim.dt, &st);
             t_screen += std::chrono::duration<double>(clock::now() - c1).count();
             total_candidates += st.candidate_pairs;
             total_refined += st.refined_pairs;
@@ -378,6 +381,7 @@ int main(int argc, char** argv) {
             t_pairs_busy += st.pairs_busy_s;
             t_transfer += st.transfer_s;
             t_refine += st.refine_s;
+            t_wait += st.wait_s;
             used_gpu = used_gpu || st.gpu;
             pair_threads = st.threads;
             max_cell_objects = std::max(max_cell_objects, st.max_cell_objects);
@@ -385,6 +389,8 @@ int main(int argc, char** argv) {
             hour.pairs += st.pairs_s;
             hour.busy += st.pairs_busy_s;
             hour.transfer += st.transfer_s;
+            hour.wait += st.wait_s;
+            hour.refine += st.refine_s;
             hour.max_cell = std::max(hour.max_cell, st.max_cell_objects);
             for (const Conjunction& c : found) {
                 const Object& a = sim.objects[c.i];
@@ -412,7 +418,10 @@ int main(int argc, char** argv) {
         hour.loop += std::chrono::duration<double>(clock::now() - step_start).count();
         if (screen && static_cast<long>(sim.t / 3600.0) > profiled_hour) {
             profiled_hour = static_cast<long>(sim.t / 3600.0);
-            double other = hour.loop - hour.prop - hour.grid - hour.pairs - hour.apply - hour.transfer;
+            // Sur GPU, grille, paires et transferts se deroulent pendant la
+            // propagation : seuls l'attente et l'affinage prennent du temps CPU.
+            double other = used_gpu ? hour.loop - hour.prop - hour.wait - hour.refine - hour.apply
+                                    : hour.loop - hour.prop - hour.grid - hour.pairs - hour.apply;
             prof_out << profiled_hour << ',' << sim.objects.size() << ',' << hour.prop << ','
                      << hour.grid << ',' << hour.pairs << ','
                      << (hour.pairs > 0 ? hour.busy / hour.pairs : 0.0) << ',' << hour.apply
@@ -481,18 +490,25 @@ int main(int argc, char** argv) {
 
     if (screen) {
         // Ou part le temps, et ce que les threads font pendant le parcours.
-        double other = t_loop - t_prop - t_grid - t_pairs - t_apply - t_copy - t_transfer;
         auto pct = [&](double x) { return 100 * x / t_loop; };
         std::cout << std::fixed << std::setprecision(2)
                   << "\n--- Profil d'execution (" << t_loop << " s au total) ---\n"
                   << "  propagation          " << t_prop << " s  (" << pct(t_prop) << " %)\n";
+        double other;
         if (used_gpu) {
-            std::cout << "  grille (GPU)         " << t_grid << " s  (" << pct(t_grid) << " %)\n"
-                      << "  paires (GPU)         " << t_pairs - t_refine << " s  ("
-                      << pct(t_pairs - t_refine) << " %)\n"
+            // Le GPU travaille PENDANT la propagation : ses temps ne s'ajoutent
+            // pas au total. Seules l'attente et l'affinage le font.
+            other = t_loop - t_prop - t_wait - t_refine - t_apply - t_copy;
+            const double gpu_total = t_grid + (t_pairs - t_refine) + t_transfer;
+            std::cout << "  attente du GPU       " << t_wait << " s  (" << pct(t_wait) << " %)\n"
                       << "  affinage (CPU)       " << t_refine << " s  (" << pct(t_refine) << " %)\n"
-                      << "  transferts CPU-GPU   " << t_transfer << " s  (" << pct(t_transfer) << " %)\n";
+                      << "  -- sur le GPU, en parallele de la propagation : " << gpu_total
+                      << " s (grille " << t_grid << ", paires " << t_pairs - t_refine
+                      << ", transferts " << t_transfer << ")\n"
+                      << "  -- recouvrement : " << std::max(0.0, gpu_total - t_wait) << " s de calcul GPU cache"
+                      << " derriere la propagation\n";
         } else {
+            other = t_loop - t_prop - t_grid - t_pairs - t_apply - t_copy;
             std::cout << "  grille               " << t_grid << " s  (" << pct(t_grid) << " %)\n"
                       << "  parcours des paires  " << t_pairs << " s  (" << pct(t_pairs) << " %), "
                       << (t_pairs > 0 ? t_pairs_busy / t_pairs : 0.0) << " threads sur "
