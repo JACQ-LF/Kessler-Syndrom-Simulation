@@ -50,6 +50,8 @@ de collisions, fragmentation, cascade.
 ## Démarrage rapide
 
 ```bash
+git clone https://github.com/JACQ-LF/Kessler-Syndrom-Simulation.git
+cd Kessler-Syndrom-Simulation
 cmake -B build
 cmake --build build
 ```
@@ -216,10 +218,12 @@ configurations alternées pour annuler la dérive thermique :
 | 8 | 0,156 s | 0,509 s | 0,437 s | 1,10 s |
 | 16 | 0,120 s | 0,511 s | 0,301 s | 0,93 s |
 
-La propagation accélère 4,9 fois, le parcours des paires 8,7 fois.
-**La construction de la grille est séquentielle et ne gagne rien** : à
-16 threads elle représente plus de la moitié du temps total, c'est le facteur
-limitant au sens d'Amdahl.
+La propagation accélère 4,9 fois, le parcours des paires 8,7 fois. La
+construction de la grille, alors séquentielle, ne gagnait rien : à 16 threads
+elle représentait plus de la moitié du temps total, le facteur limitant au sens
+d'Amdahl. Elle a depuis été réécrite — conservée d'un pas à l'autre, deux fois
+plus rapide, parallèle au-delà de 150 000 objets, ou sur GPU avec `--gpu` (voir
+*Profil d'exécution* et *Sur GPU* plus bas).
 
 **Le pas optimal n'est pas le plus petit.** Le coût de la propagation varie en
 1/dt, mais les cellules doivent grandir avec le pas, donc les paires candidates
@@ -244,7 +248,7 @@ multiplierait le nombre d'objets par 4 multiplierait ce terme par 16.
 fin de run où part le temps, et écrit `output/profile.csv` heure par heure :
 propagation, grille, parcours des paires, nombre moyen de threads réellement
 occupés pendant ce parcours, fragmentation, et population de la cellule la
-plus chargée. Deux régimes ressortent :
+plus chargée. Avant la réécriture de la grille, deux régimes ressortaient :
 
 | Phase | Catalogue seul (2 h) | Cascade ×100 (12 h) |
 |---|---|---|
@@ -301,7 +305,12 @@ Trois choix de conception :
 - **Répartition par objets.** Un thread GPU par objet, dans l'ordre trié par
   cellule : les threads d'un même warp ont des voisinages proches. Une
   répartition par cellule donnerait tout le travail d'un nuage frais à un seul
-  thread, et bloquerait les 31 autres de son warp.
+  thread, et bloquerait les 31 autres de son warp. C'est pourtant le choix
+  classique pour les milieux granulaires (Mazhar, Heyn et Negrut, *Multibody
+  System Dynamics*, 2011 : un thread par cellule), où la densité est uniforme.
+  En orbite elle ne l'est pas, et les nuages de fragments — là où démarre la
+  cascade — sont justement les cellules les plus chargées : jusqu'à 1 900
+  objets, soit 1,8 million de paires, dans la cascade de 28 h.
 - **Pré-filtre en simple précision.** Sur les GPU grand public, la double
   précision tourne à 1/64 de la simple : le filtre en double était plus lent
   sur GPU que sur CPU. Le GPU applique donc un pré-filtre en float,
@@ -463,9 +472,9 @@ CPU, il fallait plusieurs minutes par heure simulée passé 24 h.
 ./kessler_viewer
 ```
 
-Affiche l'intégralité du catalogue en temps réel. Le rendu passe par quatre
-appels instanciés — un par catégorie d'objet — et tient les 28 340 objets à
-60 fps. L'occultation par la Terre est gérée par le tampon de profondeur du
+Affiche l'intégralité du catalogue en temps réel. Le rendu passe par cinq
+appels instanciés — un par catégorie d'objet, fragments compris — et tient les
+28 340 objets à 60 fps. L'occultation par la Terre est gérée par le tampon de profondeur du
 GPU, donc correctement, contrairement aux tracés matplotlib.
 
 | Commande | Action |
