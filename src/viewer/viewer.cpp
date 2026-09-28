@@ -218,7 +218,9 @@ struct App {
     // --- Detection des rapprochements (mode Live seulement) ---
     bool detect = false;
     bool show_grid = false;          // trace les cellules de la grille de detection
-    ScreeningConfig screen_cfg;
+    ScreeningConfig screen_cfg;      // reglages de l'interface, recopies dans le Screener
+    Screener screener;               // garde ses tampons (et sa memoire GPU) d'un pas a l'autre
+    std::string gpu_message;         // nom du GPU, ou raison de son indisponibilite
     std::vector<State> before;       // etats en debut de pas, pour screen_step
     ScreeningStats last_stats;
     double detect_ms = 0.0;          // moyenne glissante, par pas
@@ -259,8 +261,8 @@ struct App {
             screen_cfg.threshold_km = max_size_m * 1e-3 * screen_cfg.radius_scale;
         }
         auto c0 = std::chrono::steady_clock::now();
-        std::vector<Conjunction> found =
-            screen_step(before, sim.objects, t0, sim.dt, screen_cfg, &last_stats);
+        screener.config() = screen_cfg;
+        std::vector<Conjunction> found = screener.screen(before, sim.objects, t0, sim.dt, &last_stats);
         double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - c0).count();
         detect_ms = detect_ms > 0 ? 0.9 * detect_ms + 0.1 * ms : ms;
@@ -290,8 +292,10 @@ struct App {
     // Un pas de simulation en mode Live avec detection, et fragmentation si
     // elle est active.
     void live_step() {
-        before.resize(sim.objects.size());
-        for (size_t i = 0; i < sim.objects.size(); ++i) before[i] = sim.objects[i].s;
+        const int n = static_cast<int>(sim.objects.size());
+        before.resize(n);
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n; ++i) before[i] = sim.objects[i].s;
         double t0 = sim.t;
         sim.step();
         std::vector<Conjunction> found = run_detection(t0);

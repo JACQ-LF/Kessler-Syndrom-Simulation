@@ -2,112 +2,74 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+
+#include "collision_filter.hpp"
+
+#ifdef KESSLER_HAS_CUDA
+#include "collision_gpu.hpp"
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
+// Tout le code OpenMP de ce fichier se limite a OpenMP 2.0 (pas de
+// reduction max, pas de taches) : c'est ce que MSVC supporte par defaut, et
+// le build CUDA sous Windows passe par MSVC.
+
 namespace kessler {
 
 namespace {
 
-// Deux objets proches subissent presque la meme gravite : leur mouvement
-// relatif s'ecarte de la ligne droite seulement via le gradient de gravite,
-// d'ordre mu / r^3 (1.4e-6 s^-2 au ras de l'atmosphere). Sur un pas dt, a
-// vitesse relative v, l'ecart est borne par GRAVITY_GRADIENT * v * dt^3.
-constexpr double GRAVITY_GRADIENT = 2e-6;  // s^-2, arrondi par exces
+using Clock = std::chrono::steady_clock;
 
-// Cles de cellule sur 3 x 21 bits. Avec une cellule d'au moins 1 km, les
-// coordonnees jusqu'a 1e6 km (au-dela de l'orbite lunaire) tiennent.
-constexpr int64_t KEY_OFFSET = int64_t(1) << 20;
-
-uint64_t cell_key(int64_t ix, int64_t iy, int64_t iz) {
-    return (static_cast<uint64_t>(ix + KEY_OFFSET) << 42) |
-           (static_cast<uint64_t>(iy + KEY_OFFSET) << 21) |
-            static_cast<uint64_t>(iz + KEY_OFFSET);
+double seconds_since(Clock::time_point t) {
+    return std::chrono::duration<double>(Clock::now() - t).count();
 }
 
-// Table de hachage plate a adressage ouvert : cle de cellule -> plage
-// d'objets. Reconstruite a chaque pas par un tri par comptage en O(N) :
-// ni allocation par cellule (une unordered_map en faisait des dizaines de
-// milliers par pas), ni tri complet (std::sort coutait 4 fois le reste de la
-// construction, alors qu'il suffit de regrouper les objets par cellule).
-constexpr uint64_t NO_CELL = ~uint64_t(0);
+int thread_count() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
 
-class CellGrid {
-public:
-    struct Cell { int64_t x, y, z; int begin, end; };
+int thread_id() {
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
 
-    std::vector<Cell> cells;   // cellules occupees
-    std::vector<int> order;    // indices d'objets, groupes par cellule
+int threads_in_team() {
+#ifdef _OPENMP
+    return omp_get_num_threads();
+#else
+    return 1;
+#endif
+}
 
-    // keys[i] : cle de cellule de l'objet i, ou NO_CELL pour l'ignorer.
-    void build(const std::vector<uint64_t>& keys,
-               const std::vector<std::array<int64_t, 3>>& coords) {
-        const size_t n = keys.size();
-        size_t cap = 16;
-        while (cap < n * 2) cap <<= 1;
-        mask_ = cap - 1;
-        slot_key_.assign(cap, NO_CELL);
-        slot_cell_.resize(cap);
-        cells.clear();
-        obj_cell_.resize(n);
+// Threads a engager sur une phase lineaire de la grille (cles, tri,
+// cellules) : chaque synchronisation coute plus cher que ~15 000 elements
+// de travail. Mesure du tri par base sur i7-11800H :
+//       cles   1 thread   meilleur
+//     28 000    0.61 ms   0.61 ms (1 thread ; 16 threads : 1.68 ms)
+//     60 000    1.38 ms   1.00 ms (4 threads)
+//    250 000    5.47 ms   2.28 ms (8 threads)
+//    500 000   11.92 ms   3.47 ms (16 threads)
+int grid_threads(int n) {
+    return std::max(1, std::min(thread_count(), n / 15000));
+}
 
-        // Passe 1 : une cellule par cle distincte, et effectif de chacune.
-        for (size_t i = 0; i < n; ++i) {
-            if (keys[i] == NO_CELL) continue;
-            size_t h = slot(keys[i]);
-            while (slot_key_[h] != NO_CELL && slot_key_[h] != keys[i]) h = (h + 1) & mask_;
-            if (slot_key_[h] == NO_CELL) {
-                slot_key_[h] = keys[i];
-                slot_cell_[h] = static_cast<int>(cells.size());
-                cells.push_back({coords[i][0], coords[i][1], coords[i][2], 0, 0});
-            }
-            int c = slot_cell_[h];
-            obj_cell_[i] = c;
-            ++cells[c].end;  // provisoirement : effectif
-        }
-
-        // Sommes cumulees : plage de chaque cellule dans `order`.
-        int run = 0;
-        for (Cell& c : cells) { int count = c.end; c.begin = c.end = run; run += count; }
-
-        // Passe 2 : rangement des objets.
-        order.resize(run);
-        for (size_t i = 0; i < n; ++i)
-            if (keys[i] != NO_CELL) order[cells[obj_cell_[i]].end++] = static_cast<int>(i);
-    }
-
-    // Plage [debut, fin[ de `order` pour la cellule, vide si inoccupee.
-    std::pair<int, int> find(uint64_t key) const {
-        size_t h = slot(key);
-        while (slot_key_[h] != NO_CELL) {
-            if (slot_key_[h] == key) {
-                const Cell& c = cells[slot_cell_[h]];
-                return {c.begin, c.end};
-            }
-            h = (h + 1) & mask_;
-        }
-        return {0, 0};
-    }
-
-private:
-    size_t slot(uint64_t k) const {
-        // Finaliseur de splitmix64 : les cles voisines se dispersent bien.
-        k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL;
-        k ^= k >> 27; k *= 0x94d049bb133111ebULL;
-        k ^= k >> 31;
-        return static_cast<size_t>(k) & mask_;
-    }
-
-    size_t mask_ = 0;
-    std::vector<uint64_t> slot_key_;
-    std::vector<int> slot_cell_;
-    std::vector<int> obj_cell_;
-};
+// ---------------------------------------------------------------------------
+// Affinage
+// ---------------------------------------------------------------------------
 
 // Interpolation cubique d'Hermite de la position relative sur le pas, pour
 // s dans [0, 1]. Elle utilise positions ET vitesses aux deux bouts du pas —
@@ -142,6 +104,180 @@ double closest_approach(const Hermite& h) {
     return 0.5 * (a + b);
 }
 
+// Affine une paire retenue par le filtre (i < j). Renvoie true et remplit
+// `out` si le rapprochement tombe dans ce pas et sous le seuil.
+bool refine_pair(const std::vector<State>& before, const std::vector<Object>& after,
+                 int i, int j, double t0, double dt, const ScreeningConfig& cfg,
+                 Conjunction& out) {
+    Hermite h{before[j].r - before[i].r, (before[j].v - before[i].v) * dt,
+              after[j].s.r - after[i].s.r, (after[j].s.v - after[i].s.v) * dt};
+    double s = closest_approach(h);
+
+    // Minimum colle a un bord : le TCA tombe dans le pas precedent (objets
+    // deja en eloignement) ou le suivant (encore en approche). Il y sera
+    // rapporte, pas ici.
+    if (s <= 1e-9 || s >= 1.0 - 1e-9) return false;
+
+    double miss = norm(h.pos(s));
+    if (miss > cfg.threshold_km) return false;
+
+    out.i = i;
+    out.j = j;
+    out.t = t0 + s * dt;
+    out.miss_km = miss;
+    out.v_rel_km_s = norm(h.vel(s)) / dt;
+    out.collision = miss < collision_radius_km(after[i], cfg.radius_scale)
+                         + collision_radius_km(after[j], cfg.radius_scale);
+    return true;
+}
+
+// Filtre d'une paire depuis les etats de debut de pas.
+int filter(const std::vector<State>& before, int i, int j, double dt,
+           double threshold_km, double vmin2) {
+    const State& a = before[i];
+    const State& b = before[j];
+    return filter_pair(b.r.x - a.r.x, b.r.y - a.r.y, b.r.z - a.r.z,
+                       b.v.x - a.v.x, b.v.y - a.v.y, b.v.z - a.v.z,
+                       dt, threshold_km, vmin2);
+}
+
+// ---------------------------------------------------------------------------
+// Grille, construite en parallele
+// ---------------------------------------------------------------------------
+
+struct KeyIdx {
+    unsigned long long key;
+    int idx;
+};
+
+struct Cell {
+    unsigned long long key;
+    int begin, end;  // plage dans le tableau trie des objets
+};
+
+// Tri par base (LSD, octet par octet), parallele et stable. Les octets
+// identiques pour toutes les cles sont sautes ; en pratique, des qu'une
+// coordonnee change de signe, tous les bits bas de son champ basculent (le
+// decalage de 2^20 fait passer de 0x100000 a 0x0FFFFF), et les 8 passes sont
+// necessaires. Remplace un tri par comparaison (std::sort coutait a lui seul
+// plus que tout le reste de la construction de la grille).
+void radix_sort(std::vector<KeyIdx>& a, std::vector<KeyIdx>& tmp,
+                std::vector<std::array<int, 256>>& hist, unsigned long long varying) {
+    const int n = static_cast<int>(a.size());
+    const int team = grid_threads(n);
+    tmp.resize(n);
+    hist.resize(thread_count());
+    for (int shift = 0; shift < 64; shift += 8) {
+        if (((varying >> shift) & 0xFFULL) == 0) continue;
+        #pragma omp parallel num_threads(team)
+        {
+            const int t = thread_id(), nt = threads_in_team();
+            const int b0 = static_cast<int>(static_cast<long long>(n) * t / nt);
+            const int b1 = static_cast<int>(static_cast<long long>(n) * (t + 1) / nt);
+            std::array<int, 256>& h = hist[t];
+            h.fill(0);
+            for (int k = b0; k < b1; ++k) ++h[(a[k].key >> shift) & 0xFF];
+            #pragma omp barrier
+            #pragma omp single
+            {
+                // Position de depart de chaque (chiffre, thread) : les chiffres
+                // dans l'ordre, et pour un meme chiffre les threads dans
+                // l'ordre, ce qui garde le tri stable.
+                int run = 0;
+                for (int d = 0; d < 256; ++d)
+                    for (int tt = 0; tt < nt; ++tt) {
+                        int c = hist[tt][d];
+                        hist[tt][d] = run;
+                        run += c;
+                    }
+            }
+            for (int k = b0; k < b1; ++k) tmp[h[(a[k].key >> shift) & 0xFF]++] = a[k];
+        }
+        a.swap(tmp);
+    }
+}
+
+// Table de hachage a adressage ouvert : cle de cellule -> indice de cellule.
+// Remplie en parallele par comparaison-echange atomique, reutilisee d'un pas
+// a l'autre (seule sa remise a vide est refaite).
+class CellTable {
+public:
+    // Vide la table et la dimensionne pour `capacity` cellules au plus.
+    void reset(size_t capacity) {
+        size_t cap = 16;
+        while (cap < capacity * 2) cap <<= 1;
+        if (cap > cap_) {
+            keys_.reset(new std::atomic<unsigned long long>[cap]);
+            cell_.reset(new int[cap]);
+            cap_ = cap;
+        }
+        mask_ = cap - 1;
+        const long long used = static_cast<long long>(cap);
+        #pragma omp parallel for schedule(static) num_threads(grid_threads(static_cast<int>(capacity)))
+        for (long long s = 0; s < used; ++s) keys_[s].store(NO_CELL, std::memory_order_relaxed);
+    }
+
+    // Version sequentielle : indice de la cellule `key`, cree avec l'indice
+    // `next` si elle n'existe pas encore (et `created` passe a true).
+    int find_or_insert(unsigned long long key, int next, bool& created) {
+        size_t h = slot(key);
+        for (;;) {
+            unsigned long long k = keys_[h].load(std::memory_order_relaxed);
+            if (k == key) { created = false; return cell_[h]; }
+            if (k == NO_CELL) {
+                keys_[h].store(key, std::memory_order_relaxed);
+                cell_[h] = next;
+                created = true;
+                return next;
+            }
+            h = (h + 1) & mask_;
+        }
+    }
+
+    // Version parallele : insere toutes les cellules (cles distinctes).
+    void build(const std::vector<Cell>& cells) {
+        const int ncells = static_cast<int>(cells.size());
+        reset(cells.size());
+        #pragma omp parallel for schedule(static) num_threads(grid_threads(ncells))
+        for (int c = 0; c < ncells; ++c) {
+            size_t h = slot(cells[c].key);
+            for (;;) {
+                unsigned long long expected = NO_CELL;
+                if (keys_[h].compare_exchange_strong(expected, cells[c].key,
+                                                     std::memory_order_relaxed)) {
+                    cell_[h] = c;
+                    break;
+                }
+                h = (h + 1) & mask_;
+            }
+        }
+    }
+
+    // Indice de la cellule de cle `key`, ou -1 si elle est vide.
+    int find(unsigned long long key) const {
+        size_t h = slot(key);
+        for (;;) {
+            unsigned long long k = keys_[h].load(std::memory_order_relaxed);
+            if (k == key) return cell_[h];
+            if (k == NO_CELL) return -1;
+            h = (h + 1) & mask_;
+        }
+    }
+
+private:
+    size_t slot(unsigned long long k) const {
+        // Finaliseur de splitmix64 : les cles voisines se dispersent bien.
+        k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL;
+        k ^= k >> 27; k *= 0x94d049bb133111ebULL;
+        k ^= k >> 31;
+        return static_cast<size_t>(k) & mask_;
+    }
+
+    std::unique_ptr<std::atomic<unsigned long long>[]> keys_;
+    std::unique_ptr<int[]> cell_;
+    size_t cap_ = 0, mask_ = 0;
+};
+
 }  // namespace
 
 double collision_radius_km(const Object& o, double scale) {
@@ -155,137 +291,167 @@ State interpolate_state(const State& a, const State& b, double dt, double s) {
     return {h.pos(s), h.vel(s) * (1.0 / dt)};
 }
 
-std::vector<Conjunction> screen_step(const std::vector<State>& before,
-                                     const std::vector<Object>& after,
-                                     double t0, double dt,
-                                     const ScreeningConfig& cfg,
-                                     ScreeningStats* stats) {
-    auto t_start = std::chrono::steady_clock::now();
-    const int n = static_cast<int>(before.size());
+// ---------------------------------------------------------------------------
+// Screener
+// ---------------------------------------------------------------------------
 
-    // Taille de cellule : deux objets qui se rapprochent a moins du seuil
-    // pendant le pas etaient, en debut de pas, a moins de
-    // v_rel,max * dt + seuil + ecart a la ligne droite. Avec une cellule au
-    // moins aussi grande, ils sont dans la meme cellule ou dans une voisine.
-    double vmax = 0.0;
-    for (int i = 0; i < n; ++i)
-        if (after[i].alive) vmax = std::max(vmax, norm(before[i].v));
-    double vrel_max = 2.0 * vmax;
-    double cell = std::max(1.0, vrel_max * dt + cfg.threshold_km
-                                    + GRAVITY_GRADIENT * vrel_max * dt * dt * dt);
-
-    // --- Grille : cle de cellule de chaque objet vivant, puis regroupement ---
-    std::vector<uint64_t> keys(n);
-    std::vector<std::array<int64_t, 3>> coords(n);
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; ++i) {
-        if (!after[i].alive) { keys[i] = NO_CELL; continue; }
-        const Vec3& r = before[i].r;
-        coords[i] = {static_cast<int64_t>(std::floor(r.x / cell)),
-                     static_cast<int64_t>(std::floor(r.y / cell)),
-                     static_cast<int64_t>(std::floor(r.z / cell))};
-        keys[i] = cell_key(coords[i][0], coords[i][1], coords[i][2]);
-    }
-    CellGrid grid;
-    grid.build(keys, coords);
-    const std::vector<int>& order = grid.order;
-    auto t_grid = std::chrono::steady_clock::now();
-
-    // --- Parcours des paires ---
-    int nthreads = 1;
-#ifdef _OPENMP
-    nthreads = omp_get_max_threads();
-#endif
-    std::vector<std::vector<Conjunction>> found(nthreads);
-    long long candidates = 0, refined = 0, co_orbiting = 0;
-    const double vmin2 = cfg.min_encounter_speed_km_s * cfg.min_encounter_speed_km_s;
-
-    // Evalue une paire candidate. Renvoie 0 si rejetee par le filtre lineaire,
-    // 1 si elle est passee a l'affinage, 2 si c'est une paire co-orbitale.
-    auto test_pair = [&](int a, int b, std::vector<Conjunction>& out) -> int {
-        int i = std::min(a, b), j = std::max(a, b);
-
-        // Filtre lineaire, depuis l'etat de debut de pas.
-        Vec3 dr = before[j].r - before[i].r;
-        Vec3 dv = before[j].v - before[i].v;
-        double dv2 = dot(dv, dv);
-        double ts = dv2 > 0 ? std::clamp(-dot(dr, dv) / dv2, 0.0, dt) : 0.0;
-        double gate = cfg.threshold_km
-                    + GRAVITY_GRADIENT * std::sqrt(dv2) * dt * dt * dt + 1e-3;
-        if (norm(dr + dv * ts) > gate) return 0;
-
-        // Trop lente pour une rencontre : voir ScreeningConfig.
-        if (dv2 < vmin2) return 2;
-
-        // Paire qui s'eloigne deja en debut de pas. Si sa trajectoire
-        // relative est convexe sur le pas, la distance est minimale au debut
-        // du pas : le rapprochement, s'il y en a eu un, appartient au pas
-        // precedent, et l'affinage ne ferait que le confirmer. La derivee
-        // seconde de |p|^2 vaut 2 |dv|^2 + 2 dr.a, avec |a| <= G |dr| : elle
-        // est positive des que |dv|^2 > G |dr|^2, ce qu'on verifie. Juste
-        // apres une fragmentation, c'est le cas de toutes les paires de
-        // fragments freres : les affiner toutes coutait 58 fois un pas normal.
-        if (dot(dr, dv) >= 0.0 && dv2 > GRAVITY_GRADIENT * dot(dr, dr)) return 0;
-
-        // Affinage : interpolation d'Hermite entre debut et fin de pas.
-        Hermite h{dr, dv * dt,
-                  after[j].s.r - after[i].s.r,
-                  (after[j].s.v - after[i].s.v) * dt};
-        double s = closest_approach(h);
-
-        // Minimum colle a un bord : le TCA tombe dans le pas precedent
-        // (objets deja en eloignement) ou le suivant (encore en approche).
-        // Il y sera rapporte, pas ici.
-        if (s <= 1e-9 || s >= 1.0 - 1e-9) return 1;
-
-        double miss = norm(h.pos(s));
-        if (miss > cfg.threshold_km) return 1;
-
-        Conjunction c;
-        c.i = i;
-        c.j = j;
-        c.t = t0 + s * dt;
-        c.miss_km = miss;
-        c.v_rel_km_s = norm(h.vel(s)) / dt;
-        c.collision = miss < collision_radius_km(after[i], cfg.radius_scale)
-                           + collision_radius_km(after[j], cfg.radius_scale);
-        out.push_back(c);
-        return 1;
-    };
-
-    // Les 13 voisines "en avant" (ordre lexicographique) : combinees aux
-    // paires internes a chaque cellule, chaque paire de cellules voisines
-    // n'est visitee qu'une fois — deux fois moins de recherches qu'en
-    // parcourant les 27 voisines de chaque objet, et par cellule plutot que
-    // par objet.
-    static const int FORWARD[13][3] = {
-        {1, -1, -1}, {1, -1, 0}, {1, -1, 1}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1},
-        {1, 1, -1},  {1, 1, 0},  {1, 1, 1},  {0, 1, -1}, {0, 1, 0}, {0, 1, 1},
-        {0, 0, 1}};
-
-    const int ncells = static_cast<int>(grid.cells.size());
-
-    // Cellule la plus peuplee : un nuage de fragments frais s'y entasse, et
-    // une cellule n'est traitee que par un seul thread.
-    int max_cell = 0;
-    for (const CellGrid::Cell& cc : grid.cells) max_cell = std::max(max_cell, cc.end - cc.begin);
-
-    // Decoupage du travail par OBJETS plutot que par cellules : une cellule
-    // surpeuplee (un nuage de fragments frais) donnerait sinon tout son
-    // travail a un seul thread. Chaque cellule est coupee en paquets d'au
-    // plus CHUNK objets ; un paquet traite les paires de ses objets avec la
-    // suite de la cellule et avec les 13 voisines en avant. La plupart des
-    // cellules tiennent en un paquet : rien ne change pour elles.
-    // Les paquets des cellules surpeuplees passent en tete de liste, pour
-    // etre distribues un par un entre tous les threads plutot que par lots.
-    constexpr int CHUNK = 16;
+struct Screener::Impl {
+    // Tampons CPU, conserves d'un pas a l'autre.
+    std::vector<KeyIdx> entries, tmp;
+    std::vector<std::array<int, 256>> hist;
+    std::vector<int> block_count, obj_cell;
+    std::vector<Cell> cells;
+    CellTable table;
     struct Work { int cell, begin, end; };
     std::vector<Work> work, light;
-    work.reserve(64);
-    light.reserve(grid.cells.size());
+    std::vector<std::vector<Conjunction>> found;
+    std::vector<double> busy;
+
+#ifdef KESSLER_HAS_CUDA
+    gpu::Context* gpu = nullptr;
+    std::vector<unsigned char> alive;
+    std::vector<std::pair<int, int>> survivors;
+    ~Impl() { gpu::destroy(gpu); }
+#endif
+
+    // Grille et parcours sur CPU.
+    void screen_cpu(const std::vector<State>& before, const std::vector<Object>& after,
+                    double t0, double dt, double cell, const ScreeningConfig& cfg,
+                    ScreeningStats& st);
+    // Grille et filtre sur GPU, affinage sur CPU. false en cas d'erreur CUDA.
+    bool screen_gpu(const std::vector<State>& before, const std::vector<Object>& after,
+                    double t0, double dt, double cell, const ScreeningConfig& cfg,
+                    ScreeningStats& st, std::string* message);
+};
+
+void Screener::Impl::screen_cpu(const std::vector<State>& before, const std::vector<Object>& after,
+                                double t0, double dt, double cell, const ScreeningConfig& cfg,
+                                ScreeningStats& st) {
+    const auto t_start = Clock::now();
+    const int n = static_cast<int>(before.size());
+    const int nthreads = thread_count();
+
+    // --- Objets vivants, compactes en (cle, indice) : comptage par bloc,
+    //     sommes cumulees, puis ecriture. Chaque bloc note aussi les bits qui
+    //     varient entre ses cles, pour sauter les octets constants du tri. ---
+    block_count.assign(nthreads + 1, 0);
+    entries.resize(n);
+    std::vector<unsigned long long> bits(nthreads, 0), firsts(nthreads, NO_CELL);
+    int alive = 0;
+    #pragma omp parallel num_threads(grid_threads(n))
+    {
+        const int t = thread_id(), nt = threads_in_team();
+        const int b0 = static_cast<int>(static_cast<long long>(n) * t / nt);
+        const int b1 = static_cast<int>(static_cast<long long>(n) * (t + 1) / nt);
+        int count = 0;
+        for (int i = b0; i < b1; ++i) count += after[i].alive ? 1 : 0;
+        block_count[t + 1] = count;
+        #pragma omp barrier
+        #pragma omp single
+        {
+            for (int tt = 0; tt < nt; ++tt) block_count[tt + 1] += block_count[tt];
+            alive = block_count[nt];
+        }
+        int w = block_count[t];
+        unsigned long long first = NO_CELL, v = 0;
+        for (int i = b0; i < b1; ++i) {
+            if (!after[i].alive) continue;
+            const Vec3& r = before[i].r;
+            unsigned long long key = cell_key(static_cast<long long>(std::floor(r.x / cell)),
+                                              static_cast<long long>(std::floor(r.y / cell)),
+                                              static_cast<long long>(std::floor(r.z / cell)));
+            entries[w++] = {key, i};
+            if (first == NO_CELL) first = key;
+            v |= key ^ first;
+        }
+        firsts[t] = first;
+        bits[t] = v;
+    }
+    entries.resize(alive);
+
+    // Deux facons de regrouper les objets par cellule, qui donnent les memes
+    // cellules donc les memes paires. Sous LARGE_GRID objets, un regroupement
+    // sequentiel en une passe (table de hachage remplie au passage, comptage,
+    // rangement) est le plus rapide : 1.8 ms par pas a 86 000 objets, contre
+    // 2.6 ms pour le tri parallele. Au-dela, le tri par base parallele prend
+    // le relais : 2.3 ms a 250 000 objets, contre 5.5 ms sur un thread.
+    constexpr int LARGE_GRID = 150000;
+    int ncells = 0;
+    if (alive < LARGE_GRID) {
+        table.reset(static_cast<size_t>(alive));
+        cells.clear();
+        obj_cell.resize(alive);
+        for (int k = 0; k < alive; ++k) {
+            bool created;
+            int c = table.find_or_insert(entries[k].key, static_cast<int>(cells.size()), created);
+            if (created) cells.push_back({entries[k].key, 0, 0});
+            obj_cell[k] = c;
+            ++cells[c].end;  // provisoirement : effectif
+        }
+        ncells = static_cast<int>(cells.size());
+        int run = 0;
+        for (Cell& c : cells) { int count = c.end; c.begin = c.end = run; run += count; }
+        tmp.resize(alive);
+        for (int k = 0; k < alive; ++k) tmp[cells[obj_cell[k]].end++] = entries[k];
+        entries.swap(tmp);
+        st.grid_s = seconds_since(t_start);
+    } else {
+        // Un bit varie entre deux cles s'il varie dans l'un des blocs ou entre
+        // les premieres cles de deux blocs : (a^c) = (a^f1) ^ (f1^f2) ^ (f2^c).
+        unsigned long long varying = 0, ref = NO_CELL;
+        for (int t = 0; t < nthreads; ++t) {
+            varying |= bits[t];
+            if (firsts[t] == NO_CELL) continue;
+            if (ref == NO_CELL) ref = firsts[t];
+            varying |= firsts[t] ^ ref;
+        }
+        radix_sort(entries, tmp, hist, varying);
+
+        // Cellules : debuts de plage (changement de cle).
+        block_count.assign(nthreads + 1, 0);
+        #pragma omp parallel num_threads(grid_threads(alive))
+        {
+            const int t = thread_id(), nt = threads_in_team();
+            const int b0 = static_cast<int>(static_cast<long long>(alive) * t / nt);
+            const int b1 = static_cast<int>(static_cast<long long>(alive) * (t + 1) / nt);
+            int count = 0;
+            for (int k = b0; k < b1; ++k)
+                if (k == 0 || entries[k].key != entries[k - 1].key) ++count;
+            block_count[t + 1] = count;
+            #pragma omp barrier
+            #pragma omp single
+            {
+                for (int tt = 0; tt < nt; ++tt) block_count[tt + 1] += block_count[tt];
+                ncells = block_count[nt];
+                cells.resize(ncells);
+            }
+            int w = block_count[t];
+            for (int k = b0; k < b1; ++k)
+                if (k == 0 || entries[k].key != entries[k - 1].key) cells[w++] = {entries[k].key, k, 0};
+        }
+        #pragma omp parallel for schedule(static) num_threads(grid_threads(ncells))
+        for (int c = 0; c < ncells; ++c) cells[c].end = c + 1 < ncells ? cells[c + 1].begin : alive;
+
+        table.build(cells);
+        st.grid_s = seconds_since(t_start);
+    }
+
+    // --- Parcours des paires, reparti par OBJETS ---
+    // Chaque cellule est coupee en paquets d'au plus CHUNK objets ; un paquet
+    // traite les paires de ses objets avec la suite de la cellule et avec les
+    // 13 voisines en avant. Les paquets des cellules surpeuplees (un nuage de
+    // fragments frais) passent en tete et sont distribues un par un : sinon
+    // un seul thread heritait de tout leur travail.
+    const auto t_pairs = Clock::now();
+    constexpr int CHUNK = 16;
+    work.clear();
+    light.clear();
+    int max_cell = 0;
     for (int c = 0; c < ncells; ++c) {
-        const CellGrid::Cell& cc = grid.cells[c];
-        std::vector<Work>& dst = (cc.end - cc.begin > CHUNK) ? work : light;
+        const Cell& cc = cells[c];
+        const int size = cc.end - cc.begin;
+        max_cell = std::max(max_cell, size);
+        std::vector<Work>& dst = size > CHUNK ? work : light;
         for (int p = cc.begin; p < cc.end; p += CHUNK)
             dst.push_back({c, p, std::min(p + CHUNK, cc.end)});
     }
@@ -293,16 +459,17 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
     work.insert(work.end(), light.begin(), light.end());
     const int nwork = static_cast<int>(work.size());
 
-    // Temps de travail effectif de chaque thread : la difference avec
-    // l'horloge murale mesure l'attente, donc le desequilibre de charge.
-    std::vector<double> busy(nthreads, 0.0);
+    found.resize(nthreads);
+    for (auto& f : found) f.clear();
+    busy.assign(nthreads, 0.0);
+    long long candidates = 0, refined = 0, co_orbiting = 0;
+    const double vmin2 = cfg.min_encounter_speed_km_s * cfg.min_encounter_speed_km_s;
+    static const int FORWARD[13][3] = KESSLER_FORWARD_NEIGHBOURS;
+
     #pragma omp parallel
     {
-        int tid = 0;
-#ifdef _OPENMP
-        tid = omp_get_thread_num();
-#endif
-        auto t_thread = std::chrono::steady_clock::now();
+        const int tid = thread_id();
+        const auto t_thread = Clock::now();
         std::vector<Conjunction>& out = found[tid];
 
         // Compteurs propres au thread, sommes une seule fois en sortie : des
@@ -311,30 +478,37 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
         long long my_candidates = 0, my_refined = 0, my_co_orbiting = 0;
         auto visit = [&](int a, int b) {
             ++my_candidates;
-            int r = test_pair(a, b, out);
-            if (r == 1) ++my_refined;
-            else if (r == 2) ++my_co_orbiting;
+            const int i = std::min(a, b), j = std::max(a, b);
+            const int r = filter(before, i, j, dt, cfg.threshold_km, vmin2);
+            if (r == FILTER_CO_ORBITING) { ++my_co_orbiting; return; }
+            if (r != FILTER_REFINE) return;
+            ++my_refined;
+            Conjunction c;
+            if (refine_pair(before, after, i, j, t0, dt, cfg, c)) out.push_back(c);
         };
         auto process = [&](const Work& wk) {
-            const CellGrid::Cell& cc = grid.cells[wk.cell];
+            const Cell& cc = cells[wk.cell];
             // Paires internes a la cellule : chaque objet du paquet avec les
             // objets qui le suivent dans la cellule.
             for (int p = wk.begin; p < wk.end; ++p)
-                for (int q = p + 1; q < cc.end; ++q) visit(order[p], order[q]);
+                for (int q = p + 1; q < cc.end; ++q) visit(entries[p].idx, entries[q].idx);
+            long long x, y, z;
+            cell_coords(cc.key, x, y, z);
             for (const auto& o : FORWARD) {
-                auto range = grid.find(cell_key(cc.x + o[0], cc.y + o[1], cc.z + o[2]));
+                const int nc = table.find(cell_key(x + o[0], y + o[1], z + o[2]));
+                if (nc < 0) continue;
+                const Cell& other = cells[nc];
                 for (int p = wk.begin; p < wk.end; ++p)
-                    for (int q = range.first; q < range.second; ++q) visit(order[p], order[q]);
+                    for (int q = other.begin; q < other.end; ++q)
+                        visit(entries[p].idx, entries[q].idx);
             }
         };
 
-        // Paquets lourds un par un, puis le reste par lots (moins de
-        // synchronisation pour des milliers de petites cellules).
         #pragma omp for schedule(dynamic, 1) nowait
         for (int w = 0; w < nheavy; ++w) process(work[w]);
         #pragma omp for schedule(dynamic, 32) nowait
         for (int w = nheavy; w < nwork; ++w) process(work[w]);
-        busy[tid] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_thread).count();
+        busy[tid] = seconds_since(t_thread);
 
         #pragma omp atomic
         candidates += my_candidates;
@@ -344,27 +518,163 @@ std::vector<Conjunction> screen_step(const std::vector<State>& before,
         co_orbiting += my_co_orbiting;
     }
 
-    auto t_pairs = std::chrono::steady_clock::now();
+    st.pairs_s = seconds_since(t_pairs);
+    st.pairs_busy_s = 0.0;
+    for (double b : busy) st.pairs_busy_s += b;
+    st.threads = nthreads;
+    st.candidate_pairs = candidates;
+    st.refined_pairs = refined;
+    st.co_orbiting = co_orbiting;
+    st.max_cell_objects = max_cell;
+    st.max_cell_pairs = static_cast<long long>(max_cell) * (max_cell - 1) / 2;
+}
+
+bool Screener::Impl::screen_gpu(const std::vector<State>& before, const std::vector<Object>& after,
+                                double t0, double dt, double cell, const ScreeningConfig& cfg,
+                                ScreeningStats& st, std::string* message) {
+#ifdef KESSLER_HAS_CUDA
+    const int n = static_cast<int>(before.size());
+    alive.resize(n);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i) alive[i] = after[i].alive ? 1 : 0;
+
+    gpu::FilterParams params;
+    params.cell_km = cell;
+    params.dt = dt;
+    params.threshold_km = cfg.threshold_km;
+    params.vmin2 = cfg.min_encounter_speed_km_s * cfg.min_encounter_speed_km_s;
+    gpu::FilterReport report;
+    if (!gpu::filter(gpu, before.data(), alive.data(), n, params, survivors, report, message))
+        return false;
+
+    // Affinage des paires retenues, en double precision, sur CPU : meme code
+    // que le backend CPU, donc memes resultats.
+    const auto t_refine = Clock::now();
+    const int nthreads = thread_count();
+    found.resize(nthreads);
+    for (auto& f : found) f.clear();
+    const int ns = static_cast<int>(survivors.size());
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int k = 0; k < ns; ++k) {
+        Conjunction c;
+        if (refine_pair(before, after, survivors[k].first, survivors[k].second, t0, dt, cfg, c))
+            found[thread_id()].push_back(c);
+    }
+    st.refine_s = seconds_since(t_refine);
+
+    st.gpu = true;
+    st.grid_s = report.grid_s;
+    st.pairs_s = report.kernel_s + st.refine_s;
+    st.transfer_s = report.upload_s + report.download_s;
+    st.pairs_busy_s = 0.0;
+    st.threads = 0;
+    st.candidate_pairs = report.candidates;
+    st.refined_pairs = ns;
+    st.co_orbiting = report.co_orbiting;
+    st.max_cell_objects = report.max_cell;
+    st.max_cell_pairs = static_cast<long long>(report.max_cell) * (report.max_cell - 1) / 2;
+    return true;
+#else
+    (void)before; (void)after; (void)t0; (void)dt; (void)cell; (void)cfg; (void)st;
+    if (message) *message = "support GPU non compile";
+    return false;
+#endif
+}
+
+Screener::Screener(const ScreeningConfig& cfg) : cfg_(cfg), impl_(new Impl) {}
+Screener::~Screener() = default;
+Screener::Screener(Screener&&) noexcept = default;
+Screener& Screener::operator=(Screener&&) noexcept = default;
+
+bool Screener::gpu_compiled() {
+#ifdef KESSLER_HAS_CUDA
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Screener::set_gpu(bool on, std::string* message) {
+#ifdef KESSLER_HAS_CUDA
+    if (!on) {
+        gpu::destroy(impl_->gpu);
+        impl_->gpu = nullptr;
+        return true;
+    }
+    if (impl_->gpu) return true;
+    impl_->gpu = gpu::create(message);
+    return impl_->gpu != nullptr;
+#else
+    if (on && message)
+        *message = "binaire compile sans CUDA (option CMake KESSLER_CUDA, build MSVC)";
+    return !on;
+#endif
+}
+
+bool Screener::gpu() const {
+#ifdef KESSLER_HAS_CUDA
+    return impl_->gpu != nullptr;
+#else
+    return false;
+#endif
+}
+
+std::vector<Conjunction> Screener::screen(const std::vector<State>& before,
+                                          const std::vector<Object>& after,
+                                          double t0, double dt, ScreeningStats* stats) {
+    ScreeningStats st;
+    const int n = static_cast<int>(before.size());
+
+    // Taille de cellule : deux objets qui se rapprochent a moins du seuil
+    // pendant le pas etaient, en debut de pas, a moins de
+    // v_rel,max * dt + seuil + ecart a la ligne droite. Avec une cellule au
+    // moins aussi grande, ils sont dans la meme cellule ou dans une voisine.
+    std::vector<double> vmax_thread(thread_count(), 0.0);
+    #pragma omp parallel
+    {
+        double v = 0.0;
+        #pragma omp for schedule(static) nowait
+        for (int i = 0; i < n; ++i)
+            if (after[i].alive) v = std::max(v, norm(before[i].v));
+        vmax_thread[thread_id()] = v;
+    }
+    double vmax = 0.0;
+    for (double v : vmax_thread) vmax = std::max(vmax, v);
+    const double vrel_max = 2.0 * vmax;
+    const double cell = std::max(1.0, vrel_max * dt + cfg_.threshold_km
+                                          + GRAVITY_GRADIENT * vrel_max * dt * dt * dt);
+    st.cell_km = cell;
+
+    bool done = false;
+    if (gpu()) {
+        std::string message;
+        done = impl_->screen_gpu(before, after, t0, dt, cell, cfg_, st, &message);
+        // Une erreur CUDA ne doit pas arreter la simulation : on repasse
+        // definitivement sur CPU.
+        if (!done) set_gpu(false);
+    }
+    if (!done) impl_->screen_cpu(before, after, t0, dt, cell, cfg_, st);
 
     std::vector<Conjunction> out;
-    for (auto& f : found) out.insert(out.end(), f.begin(), f.end());
-    std::sort(out.begin(), out.end(),
-              [](const Conjunction& a, const Conjunction& b) { return a.t < b.t; });
-
-    if (stats) {
-        stats->candidate_pairs = candidates;
-        stats->refined_pairs = refined;
-        stats->co_orbiting = co_orbiting;
-        stats->cell_km = cell;
-        stats->grid_s = std::chrono::duration<double>(t_grid - t_start).count();
-        stats->pairs_s = std::chrono::duration<double>(t_pairs - t_grid).count();
-        stats->pairs_busy_s = 0.0;
-        for (double b : busy) stats->pairs_busy_s += b;
-        stats->threads = nthreads;
-        stats->max_cell_objects = max_cell;
-        stats->max_cell_pairs = static_cast<long long>(max_cell) * (max_cell - 1) / 2;
-    }
+    for (auto& f : impl_->found) out.insert(out.end(), f.begin(), f.end());
+    // Tri par instant, puis par paire : l'ordre ne doit dependre ni du nombre
+    // de threads ni du backend.
+    std::sort(out.begin(), out.end(), [](const Conjunction& a, const Conjunction& b) {
+        if (a.t != b.t) return a.t < b.t;
+        if (a.i != b.i) return a.i < b.i;
+        return a.j < b.j;
+    });
+    if (stats) *stats = st;
     return out;
+}
+
+std::vector<Conjunction> screen_step(const std::vector<State>& before,
+                                     const std::vector<Object>& after,
+                                     double t0, double dt,
+                                     const ScreeningConfig& cfg,
+                                     ScreeningStats* stats) {
+    Screener screener(cfg);
+    return screener.screen(before, after, t0, dt, stats);
 }
 
 }  // namespace kessler

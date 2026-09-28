@@ -7,8 +7,9 @@ output/
 # Disposition des fenetres du viewer, propre a chaque poste
 imgui.ini
 
-# Build
+# Build (build/ pour MinGW, build-cuda/ pour MSVC + CUDA)
 build/
+build-*/
 *.exe
 *.o
 *.obj
